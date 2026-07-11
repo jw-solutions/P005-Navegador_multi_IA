@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="es" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IA ORCHESTRATOR - JW Solutions</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = { darkMode: 'class' }
+    </script>
+    <style>
+        /* Tintes sutiles del arcoíris (Modo Oscuro) */
+        .quad-blue   { border-color: hsl(210, 100%, 50%);  background-color: hsla(210, 100%, 15%, 0.15); }
+        .quad-green  { border-color: hsl(120, 100%, 40%);  background-color: hsla(120, 100%, 15%, 0.15); }
+        .quad-purple { border-color: hsl(270, 100%, 60%);  background-color: hsla(270, 100%, 20%, 0.15); }
+        .quad-orange { border-color: hsl(30,  100%, 50%);  background-color: hsla(30,  100%, 20%, 0.15); }
+
+        /* Destaque dorado — cuadrante "Top Pick" para la tarea activa */
+        .quad-star {
+            border-color: hsl(45, 100%, 55%) !important;
+            box-shadow:
+                0 0 28px hsla(45, 100%, 55%, 0.30),
+                0 0 0 1px hsla(45, 100%, 55%, 0.18),
+                inset 0 0 24px hsla(45, 100%, 55%, 0.06);
+            transition: box-shadow 0.45s ease, border-color 0.45s ease;
+        }
+
+        /* Scrollbars estéticos */
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 10px; }
+
+        /* ── Tema Claro ────────────────────────────────────────────── */
+        body.light-theme { background-color: #f1f5f9; color: #1e293b; }
+        body.light-theme header { background-color: #ffffff !important; border-color: #e2e8f0 !important; }
+        body.light-theme footer { background-color: #ffffff !important; border-color: #e2e8f0 !important; }
+
+        /* Fondos de contenedores */
+        body.light-theme .bg-gray-950 { background-color: #f8fafc !important; }
+        body.light-theme .bg-gray-900 { background-color: #ffffff !important; }
+        body.light-theme .bg-gray-800 { background-color: #f1f5f9 !important; }
+
+        /* Texto */
+        body.light-theme .text-gray-100,
+        body.light-theme .text-gray-200,
+        body.light-theme .text-gray-300 { color: #1e293b !important; }
+        body.light-theme .text-gray-400,
+        body.light-theme .text-gray-500,
+        body.light-theme .text-gray-600 { color: #64748b !important; }
+        body.light-theme .text-gray-700  { color: #94a3b8 !important; }
+
+        /* Colores de acento de cuadrantes (mejor contraste sobre blanco) */
+        body.light-theme .text-blue-400   { color: #2563eb !important; }
+        body.light-theme .text-green-400  { color: #16a34a !important; }
+        body.light-theme .text-purple-400 { color: #9333ea !important; }
+        body.light-theme .text-orange-400 { color: #ea580c !important; }
+        body.light-theme .text-teal-400   { color: #0d9488 !important; }
+        body.light-theme .text-yellow-600 { color: #b45309 !important; }
+
+        /* Bordes */
+        body.light-theme .border-gray-800,
+        body.light-theme .border-gray-700 { border-color: #e2e8f0 !important; }
+
+        /* Inputs, textareas, selects */
+        body.light-theme input:not([type="color"]),
+        body.light-theme textarea,
+        body.light-theme select {
+            background-color: #ffffff !important;
+            color: #1e293b !important;
+            border-color: #cbd5e1 !important;
+        }
+        body.light-theme ::placeholder { color: #94a3b8 !important; }
+
+        /* Cuadrantes: tinte más suave sobre fondo claro */
+        body.light-theme .quad-blue   { background-color: hsla(210, 100%, 50%, 0.07) !important; }
+        body.light-theme .quad-green  { background-color: hsla(120, 100%, 35%, 0.07) !important; }
+        body.light-theme .quad-purple { background-color: hsla(270, 100%, 55%, 0.07) !important; }
+        body.light-theme .quad-orange { background-color: hsla(30,  100%, 45%, 0.07) !important; }
+
+        /* Burbujas de respuesta de LLMs */
+        body.light-theme .stream-bubble {
+            background-color: rgba(248, 250, 252, 0.9) !important;
+            border-color: #e2e8f0 !important;
+            color: #334155 !important;
+        }
+
+        /* Panel de síntesis en tema claro */
+        body.light-theme #synthesis-panel { background-color: #ffffff !important; border-color: #e2e8f0 !important; }
+        body.light-theme #synthesis-header { border-color: #e2e8f0 !important; }
+
+        /* Scrollbar en tema claro */
+        body.light-theme ::-webkit-scrollbar-thumb { background: #cbd5e1; }
+
+        /* ── Vista Previa Q4 ───────────────────────────────────────── */
+        /* Dot pulsante en pestaña Vista Previa cuando hay contenido listo */
+        #q4-tab-preview .preview-ready-dot {
+            display: inline-block;
+            width: 6px; height: 6px;
+            background: #f97316;
+            border-radius: 50%;
+            margin-left: 4px;
+            animation: pulse-dot 1.2s ease-in-out infinite;
+        }
+        @keyframes pulse-dot {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50%       { opacity: 0.4; transform: scale(0.7); }
+        }
+        /* Contenedor del iframe: fondo neutro en ambos temas */
+        #q4-preview-container { background: #ffffff; }
+        body.light-theme #q4-preview-container { background: #f8fafc; }
+        /* Botones de descarga: efecto glass sobre cualquier fondo */
+        #q4-download-tools button { backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); }
+
+        /* ── Adjuntos de archivos ──────────────────────────────────── */
+        /* Indicador visual drag-over en el textarea */
+        #prompt-input.drag-over {
+            border-color: #8b5cf6 !important;
+            background-color: hsla(270, 80%, 50%, 0.08) !important;
+            outline: none;
+        }
+        /* Badges de archivos adjuntos en tema claro */
+        body.light-theme .attachment-badge {
+            background-color: #e2e8f0 !important;
+            border-color: #cbd5e1 !important;
+            color: #475569 !important;
+        }
+        body.light-theme .attachment-badge button { color: #94a3b8 !important; }
+    </style>
+</head>
+<body class="bg-gray-950 text-gray-100 h-screen flex flex-col font-sans overflow-hidden">
+
+    <!-- 1. BARRA SUPERIOR (NAVBAR) -->
+    <header class="bg-gray-900 border-b border-gray-800 px-6 py-3 flex items-center justify-between shadow-md">
+        <div class="flex items-center space-x-3">
+            <span class="text-xl font-black bg-gradient-to-r from-blue-500 via-purple-500 to-orange-500 bg-clip-text text-transparent">IA ORCHESTRATOR - JW Solutions</span>
+            <span class="text-xs bg-gray-800 text-gray-400 px-2 py-0.5 rounded-full border border-gray-700">v1.0</span>
+        </div>
+
+        <!-- Selector de 48 Tareas con buscador predictivo y auto-detección por IA -->
+        <div class="flex flex-col space-y-1 w-1/3">
+            <div class="flex items-center space-x-2">
+                <label class="text-xs text-gray-400 whitespace-nowrap">¿Qué vamos a hacer?</label>
+                <input id="task-search" type="text" placeholder="🔍 Filtrar tarea…"
+                    class="flex-1 bg-gray-800 border border-gray-700 rounded-md px-2 py-0.5 text-xs text-gray-200 placeholder-gray-500 focus:outline-none focus:border-purple-500" />
+            </div>
+            <select id="task-select" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-sm text-gray-200 focus:outline-none focus:border-purple-500">
+                <option value="auto">🤖 Auto-detectar Tarea por IA</option>
+                <option value="">── Selecciona manualmente (48 tareas) ──</option>
+                <optgroup label="⚙️ Grupo 1 — Desarrollo y Automatización (1-10, 44)">
+                    <option value="1">1. Scripts Python</option>
+                    <option value="2">2. Depuración de Código (Debugging)</option>
+                    <option value="3">3. Refactorización</option>
+                    <option value="4">4. Integración APIs (WhatsApp / Sheets)</option>
+                    <option value="5">5. Frontend HTML / CSS / JS</option>
+                    <option value="6">6. Consultas SQL Complejas</option>
+                    <option value="7">7. Expresiones Regulares</option>
+                    <option value="8">8. Web Scraping</option>
+                    <option value="9">9. Entornos Docker / Git</option>
+                    <option value="10">10. Documentación Técnica</option>
+                    <option value="44">44. Automatización de Video (FFmpeg / MoviePy)</option>
+                </optgroup>
+                <optgroup label="📊 Grupo 2 — Análisis de Datos y BI (11-20)">
+                    <option value="11">11. Modelado de Datos Relacionales</option>
+                    <option value="12">12. Fórmulas DAX Avanzadas (Power BI)</option>
+                    <option value="13">13. Power Query / M Language</option>
+                    <option value="14">14. Pandas Data Cleansing</option>
+                    <option value="15">15. Modelos Estocásticos</option>
+                    <option value="16">16. Auditoría Financiera</option>
+                    <option value="17">17. Informes y Dashboards</option>
+                    <option value="18">18. Procesamiento Grandes Volúmenes</option>
+                    <option value="19">19. Extracción PDFs Inestructurados</option>
+                    <option value="20">20. Predicción Deportiva / Monte Carlo</option>
+                </optgroup>
+                <optgroup label="🏢 Grupo 3 — Automatización de Pymes y Gestión (21-30, 48)">
+                    <option value="21">21. Google Sheets / Apps Script</option>
+                    <option value="22">22. Informes Administrativos</option>
+                    <option value="23">23. Análisis de Costos y Recursos</option>
+                    <option value="24">24. Conciliación Bancaria</option>
+                    <option value="25">25. Auditoría Fondos de Salud</option>
+                    <option value="26">26. Cotizaciones y Pólizas de Seguros</option>
+                    <option value="27">27. Planificación de Proyectos / Gantt</option>
+                    <option value="28">28. Manuales de Procedimientos / ISO</option>
+                    <option value="29">29. Evaluación de Proveedores</option>
+                    <option value="30">30. Movilidad Eléctrica (ROI)</option>
+                    <option value="48">48. Planificador de Agenda y Bloques de Tiempo</option>
+                </optgroup>
+                <optgroup label="🎮 Grupo 4 — Contenido, Gaming y Redacción (31-47)">
+                    <option value="31">31. Guiones TikTok / Reels (Gaming)</option>
+                    <option value="32">32. Estrategia YouTube Gaming</option>
+                    <option value="33">33. SEO y Redes Sociales</option>
+                    <option value="34">34. UEFN / Fortnite Creative (Verse)</option>
+                    <option value="35">35. Análisis Táctico FPS / Shooters</option>
+                    <option value="36">36. Traducción Técnica</option>
+                    <option value="37">37. Resumen Ultra-Denso de Papers</option>
+                    <option value="38">38. Brainstorming de Marcas</option>
+                    <option value="39">39. Correos y Alianzas Corporativas</option>
+                    <option value="40">40. Prompt Engineering (LLMs)</option>
+                    <option value="41">41. Corrección de Estilo y Narrativa</option>
+                    <option value="42">42. Simulación de Entrevistas Técnicas</option>
+                    <option value="43">43. Prompt Engineering para Imágenes IA (Midjourney/SDXL)</option>
+                    <option value="45">45. Guiones y Storyboarding — Contenido Corto</option>
+                    <option value="46">46. Redactor de Mensajes y Correos Cotidianos</option>
+                    <option value="47">47. Compresor de Textos y Extractor de Ideas</option>
+                </optgroup>
+            </select>
+        </div>
+
+        <!-- Configuración, Tema y Llave Maestra -->
+        <div class="flex items-center space-x-3">
+            <button id="btn-new-chat" title="Limpiar conversación y empezar de cero"
+                class="bg-gray-800 hover:bg-gray-700 text-gray-300 px-3 py-2 rounded-lg text-xs font-medium transition border border-gray-700 select-none whitespace-nowrap">
+                🔄 Nueva
+            </button>
+            <button id="btn-theme" title="Alternar tema claro / oscuro"
+                class="bg-gray-800 hover:bg-gray-700 text-gray-300 p-2 rounded-lg text-sm transition border border-gray-700 select-none">
+                🌙
+            </button>
+            <button id="btn-settings" class="bg-gray-800 hover:bg-gray-700 text-gray-300 p-2 rounded-lg text-sm transition border border-gray-700">
+                ⚙️ Ajustes
+            </button>
+        </div>
+    </header>
+
+    <!-- 2. ESPACIO DE TRABAJO (CUADRÍCULA 2x2) -->
+    <!-- id="quad-N" en cada contenedor para aplicar/quitar .quad-star desde JS -->
+    <main class="flex-1 min-h-0 p-4 grid grid-cols-2 grid-rows-2 gap-4">
+
+        <!-- CUADRANTE 1: EL OPTIMIZADOR (AZUL) -->
+        <div id="quad-1" class="quad-blue border-2 rounded-2xl p-4 flex flex-col shadow-lg">
+            <div class="flex items-center justify-between pb-2 border-b border-gray-800">
+                <div class="flex items-center space-x-2">
+                    <span id="led-1" class="h-2 w-2 rounded-full bg-green-500 animate-pulse cursor-pointer" title="Click: rotar llave API para este cuadrante"></span>
+                    <!-- id="title-1" para actualizar el texto cuando cambie la tarea -->
+                    <h2 id="title-1" class="text-xs font-bold uppercase tracking-wider text-blue-400">⚡ Cuadrante 1: Filtro Optimizador</h2>
+                </div>
+                <div class="flex items-center space-x-2">
+                    <select id="model-1" class="bg-gray-900 border border-gray-700 rounded text-xs px-2 py-0.5 text-gray-300">
+                        <option value="google/gemini-2.5-flash:free">gemini-2.5-flash:free (Recomendado)</option>
+                        <option value="meta-llama/llama-3-8b-instruct:free">llama-3-instruct:free</option>
+                    </select>
+                    <input type="checkbox" checked class="rounded border-gray-700 text-blue-600 focus:ring-0" disabled>
+                </div>
+            </div>
+            <div id="output-1" class="flex-1 overflow-y-auto pt-2 text-sm text-gray-400 space-y-2">
+                <div class="bg-gray-900/50 p-2 rounded border border-blue-500/20 text-xs">
+                    <span class="font-bold text-blue-400">[Consola de Compresión]:</span> Esperando prompt inicial para optimizar y reducir el gasto de tokens...
+                </div>
+            </div>
+        </div>
+
+        <!-- CUADRANTE 2: MODELO AVANZADO / PAGO (VERDE) -->
+        <div id="quad-2" class="quad-green border-2 rounded-2xl p-4 flex flex-col shadow-lg">
+            <div class="flex items-center justify-between pb-2 border-b border-gray-800">
+                <div class="flex items-center space-x-2">
+                    <span id="led-2" class="h-2 w-2 rounded-full bg-green-500 cursor-pointer" title="Click: rotar llave API para este cuadrante"></span>
+                    <h2 id="title-2" class="text-xs font-bold uppercase tracking-wider text-green-400">🤖 Cuadrante 2: Motor Inteligente</h2>
+                </div>
+                <div class="flex items-center space-x-2">
+                    <select id="model-2" class="bg-gray-900 border border-gray-700 rounded text-xs px-2 py-0.5 text-gray-300">
+                        <option value="anthropic/claude-3.5-sonnet">claude-3.5-sonnet (Predeterminado)</option>
+                        <option value="openai/gpt-4o">gpt-4o</option>
+                    </select>
+                    <label class="text-xs text-gray-400 flex items-center space-x-1">
+                        <input id="active-2" type="checkbox" checked class="rounded bg-gray-900 border-gray-700 text-green-600">
+                        <span>Activo</span>
+                    </label>
+                </div>
+            </div>
+            <div id="output-2" class="flex-1 overflow-y-auto pt-2 text-sm space-y-3">
+                <div class="text-xs text-gray-600 italic">Esperando primera orquestación…</div>
+            </div>
+        </div>
+
+        <!-- CUADRANTE 3: ALTERNATIVA EFICIENTE GRATIS (PÚRPURA) -->
+        <div id="quad-3" class="quad-purple border-2 rounded-2xl p-4 flex flex-col shadow-lg">
+            <div class="flex items-center justify-between pb-2 border-b border-gray-800">
+                <div class="flex items-center space-x-2">
+                    <span id="led-3" class="h-2 w-2 rounded-full bg-yellow-500 cursor-pointer" title="Click: rotar llave API para este cuadrante"></span>
+                    <h2 id="title-3" class="text-xs font-bold uppercase tracking-wider text-purple-400">💡 Cuadrante 3: Alternativa Gratis</h2>
+                </div>
+                <div class="flex items-center space-x-2">
+                    <select id="model-3" class="bg-gray-900 border border-gray-700 rounded text-xs px-2 py-0.5 text-gray-300">
+                        <option value="qwen/qwen-2.5-coder-32b-instruct:free">qwen-2.5-coder-72b:free</option>
+                        <option value="deepseek/deepseek-chat">deepseek-chat</option>
+                    </select>
+                    <label class="text-xs text-gray-400 flex items-center space-x-1">
+                        <input id="active-3" type="checkbox" checked class="rounded bg-gray-900 border-gray-700 text-purple-600">
+                        <span>Activo</span>
+                    </label>
+                </div>
+            </div>
+            <div id="output-3" class="flex-1 overflow-y-auto pt-2 text-sm text-gray-400">
+                <div class="text-xs text-gray-600 italic">Esperando primera orquestación…</div>
+            </div>
+        </div>
+
+        <!-- CUADRANTE 4: VELOCIDAD / CONTRAPESO (NARANJA) + RENDERIZADOR SVG/HTML -->
+        <div id="quad-4" class="quad-orange border-2 rounded-2xl p-4 flex flex-col shadow-lg">
+
+            <!-- Cabecera: LED + título + modelo + checkbox -->
+            <div class="flex items-center justify-between pb-2 border-b border-gray-800">
+                <div class="flex items-center space-x-2">
+                    <span id="led-4" class="h-2 w-2 rounded-full bg-gray-500 cursor-pointer" title="Click: rotar llave API para este cuadrante"></span>
+                    <h2 id="title-4" class="text-xs font-bold uppercase tracking-wider text-orange-400">🚀 Cuadrante 4: Motor de Velocidad</h2>
+                </div>
+                <div class="flex items-center space-x-2">
+                    <select id="model-4" class="bg-gray-900 border border-gray-700 rounded text-xs px-2 py-0.5 text-gray-300">
+                        <option value="meta-llama/llama-3.1-70b-instruct">llama-3.1-70b</option>
+                        <option value="google/gemma-2-27b-it:free">gemma-2-27b:free</option>
+                    </select>
+                    <label class="text-xs text-gray-400 flex items-center space-x-1">
+                        <input id="active-4" type="checkbox" class="rounded bg-gray-900 border-gray-700 text-orange-600">
+                        <span>Activo</span>
+                    </label>
+                </div>
+            </div>
+
+            <!-- Mini-pestañas: Código | Vista Previa -->
+            <div class="flex items-center space-x-1 pt-1.5 pb-1 border-b border-gray-800/40">
+                <button id="q4-tab-code"
+                    class="text-xs px-2.5 py-0.5 rounded font-medium transition bg-orange-900/40 text-orange-300 border border-orange-700/40">
+                    📝 Código
+                </button>
+                <button id="q4-tab-preview"
+                    class="text-xs px-2.5 py-0.5 rounded font-medium transition text-gray-500 hover:text-gray-400 hover:bg-gray-800/40">
+                    👁️ Vista Previa
+                </button>
+            </div>
+
+            <!-- Área de contenido: código (por defecto) o preview SVG/HTML -->
+            <div class="flex-1 min-h-0 relative mt-1">
+
+                <!-- Panel de código/texto: output del modelo -->
+                <div id="output-4" class="absolute inset-0 overflow-y-auto text-sm pt-1">
+                    <div id="q4-idle-msg" class="h-full text-gray-500 flex items-center justify-center italic text-xs">
+                        Desmarcado – Esta IA no recibirá la consulta para ahorrar tokens.
+                    </div>
+                </div>
+
+                <!-- Panel de renderizado: iframe sandboxed (sin acceso al DOM padre) -->
+                <div id="q4-preview-container" class="hidden absolute inset-0 rounded-lg overflow-hidden relative">
+                    <iframe id="q4-preview-frame"
+                            sandbox="allow-scripts"
+                            class="w-full h-full border-0"
+                            title="Renderizado SVG/HTML en vivo"></iframe>
+
+                    <!-- Herramientas flotantes de descarga — aparecen solo cuando hay SVG -->
+                    <div id="q4-download-tools" class="hidden absolute bottom-3 right-3 z-10 flex space-x-2">
+                        <button id="q4-btn-png"
+                            class="flex items-center space-x-1 bg-emerald-800/90 hover:bg-emerald-700 text-emerald-100 text-xs font-semibold px-3 py-1.5 rounded-lg shadow-lg transition select-none">
+                            <span>📥</span><span>PNG</span>
+                        </button>
+                        <button id="q4-btn-jpg"
+                            class="flex items-center space-x-1 bg-sky-800/90 hover:bg-sky-700 text-sky-100 text-xs font-semibold px-3 py-1.5 rounded-lg shadow-lg transition select-none">
+                            <span>📥</span><span>JPG</span>
+                        </button>
+                    </div>
+                </div>
+
+            </div>
+        </div>
+
+    </main>
+
+    <!-- PANEL DE SÍNTESIS — aparece tras cada ejecución, colapsable -->
+    <section id="synthesis-panel" class="shrink-0 bg-gray-900 border-t border-gray-800" style="display:none">
+        <div id="synthesis-header" class="flex items-center justify-between px-5 py-2 cursor-pointer select-none">
+            <span class="text-xs font-bold text-gray-300">📋 Síntesis y Resumen Ejecutivo</span>
+            <div class="flex items-center space-x-2">
+                <button id="btn-copy-report"
+                    class="text-xs bg-purple-900/40 hover:bg-purple-800/60 text-purple-300 border border-purple-700/40 px-3 py-1 rounded-lg transition whitespace-nowrap">
+                    📋 Copiar Reporte
+                </button>
+                <button id="synthesis-toggle"
+                    class="text-gray-500 hover:text-gray-200 text-sm px-1 transition"
+                    title="Expandir / Colapsar">▲</button>
+            </div>
+        </div>
+        <div id="synthesis-body" class="overflow-y-auto px-5 pb-3 space-y-2" style="max-height:150px">
+        </div>
+    </section>
+
+    <!-- 3. BARRA INFERIOR DE ENTRADA (PROMPT GLOBAL) -->
+    <footer class="bg-gray-900 border-t border-gray-800 px-4 pt-2 pb-4 shadow-inner flex flex-col">
+
+        <!-- Fila de badges de archivos adjuntos (oculta cuando vacía) -->
+        <div id="attachments-preview" class="flex flex-wrap gap-1.5 pb-2" style="display:none"></div>
+
+        <!-- Input oculto para selección de archivos -->
+        <input type="file" id="file-attachments" multiple style="display:none"
+            accept=".txt,.csv,.md,.py,.dax,.sql,.json,.js,.html,.css">
+
+        <!-- Fila de entrada principal -->
+        <div class="flex items-center space-x-3">
+            <!-- Botón adjuntar archivo -->
+            <button id="btn-attach" title="Adjuntar archivo de texto (txt, py, sql, json, csv…)"
+                class="bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white p-2.5 rounded-xl text-base transition border border-gray-700 select-none flex-shrink-0">
+                📎
+            </button>
+
+            <!-- Textarea principal -->
+            <div class="flex-1 relative">
+                <textarea id="prompt-input" rows="1" placeholder="Escribe tu consulta aquí… o arrastra archivos de texto encima. Tu texto pasará primero por el Optimizador."
+                    class="w-full bg-gray-950 border border-gray-800 rounded-xl pl-4 pr-12 py-3 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-purple-500 resize-none h-11 overflow-hidden transition-colors"></textarea>
+            </div>
+
+            <!-- Botón ejecutar -->
+            <button id="btn-execute" class="bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-500 hover:to-purple-500 text-white font-bold px-6 py-2.5 rounded-xl text-sm transition shadow-md whitespace-nowrap">
+                Ejecutar Orquestación
+            </button>
+        </div>
+    </footer>
+
+    <!-- type="module" aísla el scope: AppState, QuadrantState y demás variables
+         top-level de app.js NO son accesibles desde la consola del navegador.
+         Los módulos ES son siempre strict-mode y deferred por especificación. -->
+    <script type="module" src="app.js"></script>
+</body>
+</html>
