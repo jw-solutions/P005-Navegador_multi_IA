@@ -31,7 +31,7 @@
 ```
 D:\PROYECTOS\Navegador IA\
 ├── index.html          # UI completa: HTML + CSS (Tailwind + custom) + referencias
-├── app.js              # Toda la lógica JS (~2845 líneas)
+├── app.js              # Toda la lógica JS (~4850 líneas)
 ├── iniciar.bat         # Launcher de producción (servidor oculto + Edge app mode)
 ├── debug.bat           # Launcher de diagnóstico (PowerShell visible con logs HTTP)
 ├── Navegador IA.vbs    # Script WSH intermediario — abre iniciar.bat sin ventana negra
@@ -95,32 +95,32 @@ El `.vbs` usa `WshShell.Run(..., 0)` para invocar `iniciar.bat` completamente oc
 
 | Línea aprox. | Módulo / Constante         | Responsabilidad                                              |
 |--------------|----------------------------|--------------------------------------------------------------|
-| 8            | `AppState`                 | Pool de keys en RAM. Nunca a disco en texto plano.           |
+| 8            | `AppState`                 | Pool de keys en RAM + `pipelineMode` activo. Nunca a disco.  |
 | 16–29        | Constantes globales        | `STORAGE_KEY`, `PBKDF2_ITERATIONS`, límites adjuntos         |
-| 44           | `Crypto`                   | AES-GCM 256 + PBKDF2 via WebCrypto API                       |
-| 100          | `Storage`                  | Leer/guardar blob cifrado en localStorage                    |
-| 110          | `LockScreen`               | Pantalla de desbloqueo con callback `_onUnlock`              |
-| 219          | `SettingsModal`            | Modal 2 pisos: Piso 1 libre (tema+colores), Piso 2 protegido |
-| 632          | `UI`                       | Toast, actualización botón ajustes                           |
-| 674–684      | Constantes API             | `OPENROUTER_URL`, `RETRYABLE_CODES`, `MODEL_404_FALLBACKS`   |
-| 686–693      | System prompts             | `SYSTEM_Q1`, `SYSTEM_ANTI_FLUFF`, `SYSTEM_COMPACTOR`         |
-| 700          | `QuadrantState`            | Estado por cuadrante: `keyIndex`, `controller`, `history[]`  |
-| 712          | `LED`                      | Semáforos visuales + click handler de rotación manual        |
-| 761          | `Output`                   | Render de burbujas (streaming), mensajes de error/warn       |
-| 853          | `fetchStreamForQuadrant`   | Fetch SSE, retry 429/402, fallback 404, `_DevSim` hook       |
-| 1045         | `Memory`                   | Ventana móvil: trigger=10, compacta 8, preserva 2            |
-| 1170         | `Pipeline`                 | Flag `active` + botón Cancelar                               |
-| 1203         | `Orchestrator`             | Fase 1 (Q1 secuencial) → Fase 2 (Q2/Q3/Q4 paralelo)         |
-| 1452         | `TASK_MATRIX`              | 49 entradas (`default` + `'1'`…`'48'`), 4 grupos            |
-| 2128         | `TaskRouter`               | Aplica TASK_MATRIX al DOM: títulos, selects, `.quad-star`    |
-| 2204         | `QuadrantColors`           | Colores personalizados — inline style con `!important`       |
-| 2228         | `Theme`                    | Toggle claro/oscuro — `body.light-theme`                     |
-| 2294         | `Synthesis`                | Panel post-ejecución: comparativa + copy report              |
-| 2388         | `Q4Preview`                | Renderizador SVG/HTML en iframe sandboxed + pestañas         |
-| 2479         | `downloadQ4Render`         | Exportación SVG → PNG/JPG (canvas x2 High-DPI)              |
-| 2556         | `FileAttachments`          | Lectura FileReader UTF-8, badges, drag & drop, inject prompt |
-| 2643         | `newConversation()`        | Reset total: historiales, outputs, LEDs, adjuntos, preview   |
-| 2695         | `DOMContentLoaded`         | Init de todos los módulos y event bindings                   |
+| 45           | `Crypto`                   | AES-GCM 256 + PBKDF2 via WebCrypto API                       |
+| 101          | `Storage`                  | Leer/guardar blob cifrado en localStorage                    |
+| 111          | `LockScreen`               | Pantalla de desbloqueo con callback `_onUnlock`              |
+| 220          | `SettingsModal`            | Modal 2 pisos: Piso 1 libre (tema+colores), Piso 2 protegido |
+| 633          | `UI`                       | Toast, actualización botón ajustes                           |
+| 675–685      | Constantes API             | `OPENROUTER_URL`, `RETRYABLE_CODES`, `MODEL_404_FALLBACKS`   |
+| 688–696      | System prompts             | `SYSTEM_Q1`, `SYSTEM_ANTI_FLUFF`, `SYSTEM_COMPACTOR`, `CHAIN_FAILURE_PREFIX` |
+| 706          | `QuadrantState`            | Estado por cuadrante: `keyIndex`, `controller`, `history[]`  |
+| 718          | `LED`                      | Semáforos visuales + click handler de rotación manual        |
+| 767          | `Output`                   | Render de burbujas (streaming), mensajes de error/warn       |
+| 859          | `fetchStreamForQuadrant`   | Fetch SSE, retry 429/402, fallback 404, `_DevSim` hook       |
+| 1051         | `Memory`                   | Ventana móvil: trigger=10, compacta 8, preserva 2            |
+| 1176         | `Pipeline`                 | Flag `active` + botón Cancelar                               |
+| 1209         | `Orchestrator`             | Fase 1 (Q1) → bifurca Fase 2 en `_runParallel` / `_runChain` según `pipelineMode` |
+| 1538         | `TASK_MATRIX`              | 58 entradas (`default` + `'1'`…`'56'`), 5 grupos             |
+| 4135         | `TaskRouter`               | Aplica TASK_MATRIX al DOM: títulos, selects, `.quad-star`, badge de modo |
+| 4230         | `QuadrantColors`           | Colores personalizados — inline style con `!important`       |
+| 4254         | `Theme`                    | Toggle claro/oscuro — `body.light-theme`                     |
+| 4320         | `Synthesis`                | Panel post-ejecución: comparativa + copy report              |
+| 4414         | `Q4Preview`                | Renderizador SVG/HTML en iframe sandboxed + pestañas         |
+| 4505         | `downloadQ4Render`         | Exportación SVG → PNG/JPG (canvas x2 High-DPI)              |
+| 4582         | `FileAttachments`          | Lectura FileReader UTF-8, badges, drag & drop, inject prompt |
+| 4669         | `newConversation()`        | Reset total: historiales, outputs, LEDs, adjuntos, preview   |
+| 4713         | `DOMContentLoaded`         | Init de todos los módulos y event bindings                   |
 
 ---
 
@@ -135,7 +135,7 @@ rawPrompt
   │
   ├─ [si task-select === "auto"]
   │    └─ Orchestrator._autoDetect(prompt)   ← mini-fetch no-streaming gemini-2.5-flash:free
-  │         └─ detecta tarea 1-48 → TaskRouter.apply(n)
+  │         └─ detecta tarea 1-56 → TaskRouter.apply(n)
   │
   ├─ Pipeline.active = true
   │
@@ -151,22 +151,44 @@ rawPrompt
   │
   ├─ optimizedText (o prompt original si Q1 falla)
   │
-  ╔═══════════════════════════════════════════════════════════╗
-  ║  FASE 2 — Q2, Q3, Q4 en paralelo (Promise.allSettled)    ║
-  ║                                                           ║
-  ║  [override Q4 system prompt si tarea tiene q4SystemPrompt]║
-  ║                                                           ║
-  ║  Para cada qId activo:                                    ║
-  ║    Memory.push(qId, 'user', finalPrompt)                  ║
-  ║    fetchStreamForQuadrant(qId, history)                   ║
-  ║      → Output.appendToken(qId, token)   SSE stream        ║
-  ║    Memory.push(qId, 'assistant', response)                ║
-  ║    Memory.compact(qId) si trigger       fire-and-forget   ║
-  ║    [si qId===4] Q4Preview.render(response)                ║
-  ╚═══════════════════════════════════════════════════════════╝
+  ├─ activeTask = TASK_MATRIX[AppState.currentTask] ?? TASK_MATRIX.default
+  ├─ mode = activeTask.pipelineMode ?? 'parallel'
+  │
+  ├─[mode === 'parallel']──────────────────────────────────────┐
+  │  ╔═══════════════════════════════════════════════════════╗ │
+  │  ║  _runParallel — Q2, Q3, Q4 en paralelo (allSettled)  ║ │
+  │  ║  [override Q4 system prompt si activeTask.q4SystemPrompt]║ │
+  │  ║  Para cada qId activo:                                 ║ │
+  │  ║    Memory.push(qId, 'user', finalPrompt)               ║ │
+  │  ║    fetchStreamForQuadrant(qId, history)  → SSE stream  ║ │
+  │  ║    Memory.push(qId, 'assistant', response)             ║ │
+  │  ║    Memory.compact(qId) si trigger    fire-and-forget   ║ │
+  │  ║    [si qId===4] Q4Preview.render(response)             ║ │
+  │  ╚═══════════════════════════════════════════════════════╝ │
+  └──────────────────────────────────────────────────────────────┘
+  │
+  ├─[mode === 'chain']─────────────────────────────────────────┐
+  │  ╔═══════════════════════════════════════════════════════╗ │
+  │  ║  _runChain — Q2 → Q3 → Q4 secuencial, contexto acumulado║ │
+  │  ║  accumulatedContext = finalPrompt                       ║ │
+  │  ║  for qId of downstream (en orden):                      ║ │
+  │  ║    aplica qConf.chainSystemPrompt a history[0]          ║ │
+  │  ║    Memory.push(qId, 'user', accumulatedContext)         ║ │
+  │  ║    fetchStreamForQuadrant(qId, history)  → SSE stream   ║ │
+  │  ║    éxito: Memory.push assistant + acumula               ║ │
+  │  ║      accumulatedContext = originalPrompt +               ║ │
+  │  ║        [OUTPUT CUADRANTE n] por cada output previo       ║ │
+  │  ║    fallo: revierte push, nota de fallo en el contexto    ║ │
+  │  ║      del siguiente cuadrante (degradación elegante)      ║ │
+  │  ╚═══════════════════════════════════════════════════════╝ │
+  └──────────────────────────────────────────────────────────────┘
   │
   └─ Synthesis.render(downstream, finalPrompt)   ← panel post-ejecución
 ```
+
+`pipelineMode` no es un toggle manual — lo fuerza la tarea seleccionada en `TASK_MATRIX`.
+`TaskRouter.apply()` actualiza `AppState.pipelineMode` y el badge `#pipeline-mode-badge`
+(🔗 Cadena / ⚡ Paralelo) puramente como indicador visual.
 
 ---
 
@@ -290,15 +312,25 @@ Descarga:
 
 ### Estructura de una entrada
 ```js
-'17': {
-  q1Title: '⚡ Sintetizador KPI',     // título del h2 de Q1
-  q2: { title: '...', models: [{id, label}, ...] },
-  q3: { title: '...', models: [{id, label}, ...] },
-  q4: { title: '...', models: [{id, label}, ...] },
-  q4SystemPrompt: '...',              // opcional — override del system prompt de Q4
-  star: 2,                            // qId del "Top Pick" (borde dorado .quad-star)
+'1': {
+  pipelineMode: 'chain',              // 'chain' | 'parallel' — fuerza el modo de ejecución
+  chainContext: 'full',               // 'full' — cada Q recibe prompt original + outputs previos
+  q1Title: '⚡ Filtro de Sintaxis',    // título del h2 de Q1
+  q2: {
+    title: '...', models: [{id, label}, ...],
+    role: 'Descripción corta del rol en la cadena',
+    chainSystemPrompt: '...',         // system prompt de Q2 en modo chain (reemplaza SYSTEM_ANTI_FLUFF)
+  },
+  q3: { title: '...', models: [...], role: '...', chainSystemPrompt: '...' },
+  q4: { title: '...', models: [...], role: '...', chainSystemPrompt: '...' },
+  q4SystemPrompt: '...',              // opcional — override legacy de Q4, solo aplica en modo parallel
+  star: 3,                            // qId del "Top Pick" (borde dorado .quad-star)
 }
 ```
+
+`chainSystemPrompt` sustituye a `SYSTEM_ANTI_FLUFF` en `history[0]` **únicamente** cuando
+`pipelineMode === 'chain'`; en modo `parallel` se ignora. El campo `default` mantiene
+`pipelineMode: 'parallel'` (estado genérico sin tarea seleccionada).
 
 ### Grupos de tareas
 | Grupo | Tareas | Dominio |
@@ -307,20 +339,26 @@ Descarga:
 | 2 | 11–20 | Análisis de Datos y BI (DAX, Pandas, Power BI, Monte Carlo) |
 | 3 | 21–30, 48 | Pymes y Gestión (Sheets, ISO, Seguros, Agenda) |
 | 4 | 31–47 | Contenido, Gaming, Redacción, IA Visual (SVG, Storyboard) |
+| 5 | 49–56 | Flujos Avanzados de Orquestación (ensemble, RAG simulado, LLMOps, agentes) |
 
-**Total: 48 tareas + `default` + `auto` (detección semántica) = 50 entradas en el selector.**
+**Total: 56 tareas + `default` + `auto` (detección semántica) = 58 entradas en el selector.**
+Todas las tareas 1–56 usan `pipelineMode: 'chain'`; `default` usa `pipelineMode: 'parallel'`.
 
 ### Auto-detección semántica (`value="auto"`)
 - Mini-fetch no-streaming a `google/gemini-2.5-flash:free`
-- System prompt: lista completa 1-48 + instrucción "responde solo con el número"
+- System prompt: lista completa 1-56 + instrucción "responde solo con el número"
 - Respuesta parseada como `parseInt` → `TaskRouter.apply(n)`
 - Si falla: fallback a `'default'`, toast de aviso
 - Se ejecuta ANTES del pipeline pero DESPUÉS de `Pipeline.active = true`
 
-### q4SystemPrompt override
-Tareas con instrucciones especiales para Q4 (fuerzan formato SVG en código markdown):
+### q4SystemPrompt override (legado, solo modo parallel)
+Tareas con instrucciones especiales para Q4 (fuerzan formato SVG en código markdown),
+usadas cuando `Orchestrator._runParallel()` procesa la tarea:
 - **Tarea 17** — Informes y Dashboards → obliga bloque ` ```svg/html ``` ` sin texto adicional
 - **Tarea 43** — Prompt Engineering para Imágenes IA → ídem
+
+En modo `chain` (el caso de estas dos tareas, como todas las 1–56), el system prompt de Q4
+lo controla `q4.chainSystemPrompt` dentro de `Orchestrator._runChain()`, con el mismo contenido.
 
 ---
 
@@ -330,9 +368,10 @@ Tareas con instrucciones especiales para Q4 (fuerzan formato SVG en código mark
 <input id="task-search" placeholder="🔍 Filtrar tarea…">
 <select id="task-select">
   <option value="auto">🤖 Auto-detectar Tarea por IA</option>
-  <option value="">── Selecciona manualmente (48 tareas) ──</option>
+  <option value="">── Selecciona manualmente (56 tareas) ──</option>
   <optgroup label="⚙️ Grupo 1..."> ... </optgroup>
   ...
+  <optgroup label="🧠 Grupo 5 — Flujos Avanzados de Orquestación"> ... </optgroup>
 </select>
 ```
 
@@ -357,9 +396,10 @@ Lógica en DOMContentLoaded:
 | Cifrado AES-GCM keys | ✅ Estable | PBKDF2 200k iter, salt+IV por save |
 | SettingsModal 2 pisos | ✅ Estable | Piso 2 siempre relockea al abrir |
 | Memoria ventana móvil | ✅ Estable | Trigger 10, compacta 8, preserva 2 |
-| TASK_MATRIX 48 tareas | ✅ Completo | 4 grupos, modelos óptimos por tarea |
+| TASK_MATRIX 56 tareas | ✅ Completo | 5 grupos, modelos óptimos por tarea |
+| Pipeline en Cadena | ✅ Completo | `_runChain()`: Q2→Q3→Q4 secuencial, contexto acumulado, degradación elegante en fallo |
 | Buscador predictivo | ✅ Completo | Filtra options/optgroups en tiempo real |
-| Auto-detect semántico | ✅ Completo | gemini-2.5-flash → tarea 1-48 |
+| Auto-detect semántico | ✅ Completo | gemini-2.5-flash → tarea 1-56 |
 | Adjuntos de archivo | ✅ Completo | FileReader UTF-8, drag & drop, badges |
 | Síntesis post-ejecución | ✅ Completo | Colapsable, copy to clipboard |
 | Nueva Conversación | ✅ Completo | Reset total sin tocar keys/prefs |
@@ -399,7 +439,8 @@ Lógica en DOMContentLoaded:
 |----------|------|-------------|
 | `AppState.apiKeys` | `string[]` | Keys descifradas (solo sesión) |
 | `AppState.isUnlocked` | `bool` | Estado de autenticación |
-| `AppState.currentTask` | `string` | Tarea activa (`'default'`, `'1'`…`'48'`) |
+| `AppState.currentTask` | `string` | Tarea activa (`'default'`, `'1'`…`'56'`) |
+| `AppState.pipelineMode` | `'parallel'` \| `'chain'` | Modo de la tarea activa, lo fija `TaskRouter.apply()` |
 | `stagedFiles` | `Object[]` | Adjuntos pendientes `{name, ext, size, content}` |
 | `QuadrantState[1..4].history` | `Object[]` | Historial OpenAI-compatible por cuadrante |
 | `QuadrantState[1..4].keyIndex` | `number` | Índice de key activa por cuadrante |
@@ -426,11 +467,20 @@ SYSTEM_COMPACTOR (Compactador semántico de fondo):
    solo párrafo ultra-denso los hechos clave, variables definidas, tecnologías
    acordadas, código generado y el estado actual del problema."
 
-q4SystemPrompt — Tareas 17 y 43 (override visual):
+q4SystemPrompt — Tareas 17 y 43 (override visual, legado modo parallel):
   "Genera exclusivamente el [mockup SVG / elemento visual] solicitado.
    REGLA OBLIGATORIA: encapsula TODO el código dentro de un único bloque
    Markdown (```svg ... ``` o ```html ... ```). Sin texto introductorio,
    sin explicaciones, sin conclusiones."
+
+CHAIN_FAILURE_PREFIX (reservado para uso futuro en chainSystemPrompt de Q3/Q4):
+  "[NOTA DEL PIPELINE]: El cuadrante anterior no produjo output.
+   Trabaja con el mejor contexto disponible e indica al inicio de tu
+   respuesta qué información te faltó para completar tu rol óptimamente."
+
+chainSystemPrompt — una entrada por Q2/Q3/Q4 en cada una de las 56 tareas:
+  Reemplaza a SYSTEM_ANTI_FLUFF en modo 'chain'. Define el rol específico
+  del cuadrante dentro de la cadena (ej. "Arquitecto" → "Implementador" → "QA").
 ```
 
 ---
@@ -456,7 +506,27 @@ Checklist:
 
 ## 14. Changelog
 
-### v1.3.0 — Julio 2025 *(sesión actual)*
+### v1.4.0 — Julio 2026 *(sesión actual)*
+- **[NEW]** Rediseño arquitectural: Pipeline en Cadena Multi-Rol Especializado
+  - `pipelineMode` (`'chain'` | `'parallel'`) por tarea en `TASK_MATRIX`; `default` sigue en `'parallel'`
+  - `Orchestrator._runChain()`: ejecuta Q2 → Q3 → Q4 secuencialmente, cada uno recibe
+    el prompt original + todos los outputs previos acumulados (`chainContext: 'full'`)
+  - `Orchestrator._runParallel()`: el comportamiento original (Promise.allSettled) extraído sin cambios funcionales
+  - `Orchestrator.run()` bifurca la Fase 2 según `activeTask.pipelineMode`
+  - Degradación elegante: si un cuadrante falla en la cadena, el siguiente recibe una nota
+    explícita del fallo y continúa con el mejor contexto disponible en vez de abortar
+  - `chainSystemPrompt` por Q2/Q3/Q4 en cada tarea — reemplaza `SYSTEM_ANTI_FLUFF` solo en modo `chain`
+  - Constante `CHAIN_FAILURE_PREFIX` añadida junto a `SYSTEM_COMPACTOR`
+- **[NEW]** 8 tareas nuevas (49–56): Investigación Predictiva/Ensemble, Auditoría de Código
+  Multi-Capa, Contenido Estratégico Multi-Canal, RAG Simulado, Prompt Engineering Colaborativo,
+  Diseño de Agentes Autónomos, LLMOps/Auditoría de Costos IA, Fine-Tuning Strategy
+  — nuevo optgroup "🧠 Grupo 5 — Flujos Avanzados de Orquestación" en `index.html`
+- **[NEW]** Badge `#pipeline-mode-badge` en la navbar junto al selector de tareas — indicativo,
+  no es un toggle manual; `TaskRouter.apply()` lo actualiza junto con `AppState.pipelineMode`
+- **[UPDATE]** `Orchestrator._autoDetect()`: `TASK_LIST` incluye tareas 49–56, rango de validación 1-48 → 1-56
+- **[UPDATE]** `TASK_MATRIX` completa: 56 tareas (todas en modo `chain`) + `default` (`parallel`) = 57 entradas de configuración, 58 en el selector con `auto`
+
+### v1.3.0 — Julio 2025
 - **[NEW]** Descarga SVG → PNG/JPG desde Q4 (canvas ×2 High-DPI, fondo blanco JPG)
 - **[NEW]** Panel flotante de herramientas de descarga en Q4 Vista Previa (oculto hasta detección SVG)
 - **[NEW]** `q4SystemPrompt` por tarea: override del system prompt de Q4 en runtime

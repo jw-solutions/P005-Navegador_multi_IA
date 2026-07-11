@@ -141,10 +141,15 @@
                 <label class="text-xs text-gray-400 whitespace-nowrap">¿Qué vamos a hacer?</label>
                 <input id="task-search" type="text" placeholder="🔍 Filtrar tarea…"
                     class="flex-1 bg-gray-800 border border-gray-700 rounded-md px-2 py-0.5 text-xs text-gray-200 placeholder-gray-500 focus:outline-none focus:border-purple-500" />
+                <span id="pipeline-mode-badge"
+                    class="hidden text-[10px] font-bold px-2 py-0.5 rounded-full border
+                           bg-blue-900/30 text-blue-300 border-blue-700/40 whitespace-nowrap select-none">
+                    🔗 Cadena
+                </span>
             </div>
             <select id="task-select" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-sm text-gray-200 focus:outline-none focus:border-purple-500">
                 <option value="auto">🤖 Auto-detectar Tarea por IA</option>
-                <option value="">── Selecciona manualmente (48 tareas) ──</option>
+                <option value="">── Selecciona manualmente (56 tareas) ──</option>
                 <optgroup label="⚙️ Grupo 1 — Desarrollo y Automatización (1-10, 44)">
                     <option value="1">1. Scripts Python</option>
                     <option value="2">2. Depuración de Código (Debugging)</option>
@@ -200,6 +205,16 @@
                     <option value="45">45. Guiones y Storyboarding — Contenido Corto</option>
                     <option value="46">46. Redactor de Mensajes y Correos Cotidianos</option>
                     <option value="47">47. Compresor de Textos y Extractor de Ideas</option>
+                </optgroup>
+                <optgroup label="🧠 Grupo 5 — Flujos Avanzados de Orquestación">
+                    <option value="49">49. Investigación Predictiva / Ensemble Multi-Modelo</option>
+                    <option value="50">50. Auditoría de Código Multi-Capa</option>
+                    <option value="51">51. Contenido Estratégico Multi-Canal</option>
+                    <option value="52">52. RAG Simulado / Análisis de Documento</option>
+                    <option value="53">53. Prompt Engineering Colaborativo</option>
+                    <option value="54">54. Diseño de Agentes Autónomos</option>
+                    <option value="55">55. LLMOps / Auditoría de Costos IA</option>
+                    <option value="56">56. Fine-Tuning Strategy</option>
                 </optgroup>
             </select>
         </div>
