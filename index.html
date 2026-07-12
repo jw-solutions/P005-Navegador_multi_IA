@@ -249,8 +249,8 @@
                 </div>
                 <div class="flex items-center space-x-2">
                     <select id="model-1" class="bg-gray-900 border border-gray-700 rounded text-xs px-2 py-0.5 text-gray-300">
-                        <option value="google/gemini-2.5-flash:free">gemini-2.5-flash:free (Recomendado)</option>
-                        <option value="meta-llama/llama-3-8b-instruct:free">llama-3-instruct:free</option>
+                        <option value="meta-llama/llama-3.3-70b-instruct:free">llama-3.3-70b:free (Recomendado)</option>
+                        <option value="meta-llama/llama-3.2-3b-instruct:free">llama-3.2-3b:free</option>
                     </select>
                     <input type="checkbox" checked class="rounded border-gray-700 text-blue-600 focus:ring-0" disabled>
                 </div>
@@ -271,7 +271,7 @@
                 </div>
                 <div class="flex items-center space-x-2">
                     <select id="model-2" class="bg-gray-900 border border-gray-700 rounded text-xs px-2 py-0.5 text-gray-300">
-                        <option value="anthropic/claude-3.5-sonnet">claude-3.5-sonnet (Predeterminado)</option>
+                        <option value="anthropic/claude-sonnet-5">claude-sonnet-5 (Predeterminado)</option>
                         <option value="openai/gpt-4o">gpt-4o</option>
                     </select>
                     <label class="text-xs text-gray-400 flex items-center space-x-1">
@@ -294,7 +294,7 @@
                 </div>
                 <div class="flex items-center space-x-2">
                     <select id="model-3" class="bg-gray-900 border border-gray-700 rounded text-xs px-2 py-0.5 text-gray-300">
-                        <option value="qwen/qwen-2.5-coder-32b-instruct:free">qwen-2.5-coder-72b:free</option>
+                        <option value="qwen/qwen3-coder:free">qwen3-coder:free</option>
                         <option value="deepseek/deepseek-chat">deepseek-chat</option>
                     </select>
                     <label class="text-xs text-gray-400 flex items-center space-x-1">
@@ -320,7 +320,7 @@
                 <div class="flex items-center space-x-2">
                     <select id="model-4" class="bg-gray-900 border border-gray-700 rounded text-xs px-2 py-0.5 text-gray-300">
                         <option value="meta-llama/llama-3.1-70b-instruct">llama-3.1-70b</option>
-                        <option value="google/gemma-2-27b-it:free">gemma-2-27b:free</option>
+                        <option value="openai/gpt-oss-20b:free">gpt-oss-20b:free</option>
                     </select>
                     <label class="text-xs text-gray-400 flex items-center space-x-1">
                         <input id="active-4" type="checkbox" class="rounded bg-gray-900 border-gray-700 text-orange-600">
@@ -381,14 +381,25 @@
         <div id="synthesis-header" class="flex items-center justify-between px-5 py-2 cursor-pointer select-none">
             <span class="text-xs font-bold text-gray-300">📋 Síntesis y Resumen Ejecutivo</span>
             <div class="flex items-center space-x-2">
-                <button id="btn-copy-report"
-                    class="text-xs bg-purple-900/40 hover:bg-purple-800/60 text-purple-300 border border-purple-700/40 px-3 py-1 rounded-lg transition whitespace-nowrap">
-                    📋 Copiar Reporte
-                </button>
-                <button id="btn-generate-report" title="Descarga un reporte técnico de diagnóstico (errores, modelos, rotaciones de key) para el equipo de soporte"
-                    class="text-xs bg-teal-900/40 hover:bg-teal-800/60 text-teal-300 border border-teal-700/40 px-3 py-1 rounded-lg transition whitespace-nowrap">
-                    🩺 Generar Reporte Técnico
-                </button>
+                <!-- Menú de reportes: agrupa "copiar respuestas" y "descargar diagnóstico técnico" -->
+                <div class="relative">
+                    <button id="btn-reports-menu"
+                        class="text-xs bg-purple-900/40 hover:bg-purple-800/60 text-purple-300 border border-purple-700/40 px-3 py-1 rounded-lg transition whitespace-nowrap flex items-center gap-1">
+                        📊 Reportes <span class="text-[10px]">▾</span>
+                    </button>
+                    <div id="reports-menu-dropdown"
+                        class="hidden absolute right-0 top-full mt-1 w-60 bg-gray-800 border border-gray-700 rounded-lg shadow-lg z-20 overflow-hidden">
+                        <button id="btn-copy-report"
+                            class="w-full text-left px-3 py-2 text-xs text-gray-300 hover:bg-gray-700 transition">
+                            📋 Copiar Respuestas de las IAs
+                        </button>
+                        <button id="btn-generate-report"
+                            title="Descarga un reporte técnico de diagnóstico (errores, modelos, rotaciones de key) para el equipo de soporte"
+                            class="w-full text-left px-3 py-2 text-xs text-teal-300 hover:bg-gray-700 transition border-t border-gray-700">
+                            🩺 Reporte Técnico de Diagnóstico (.md)
+                        </button>
+                    </div>
+                </div>
                 <button id="synthesis-toggle"
                     class="text-gray-500 hover:text-gray-200 text-sm px-1 transition"
                     title="Expandir / Colapsar">▲</button>

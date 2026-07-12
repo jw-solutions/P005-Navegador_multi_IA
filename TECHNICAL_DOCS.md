@@ -77,8 +77,8 @@ El `.vbs` usa `WshShell.Run(..., 0)` para invocar `iniciar.bat` completamente oc
 
 | ID  | Color    | Clase CSS      | Rol principal             | Modelo default          |
 |-----|----------|----------------|---------------------------|-------------------------|
-| Q1  | Azul     | `.quad-blue`   | Compresor/Optimizador     | `gemini-2.5-flash:free` |
-| Q2  | Verde    | `.quad-green`  | Motor principal de calidad| `claude-3.5-sonnet`     |
+| Q1  | Azul     | `.quad-blue`   | Compresor/Optimizador     | `llama-3.3-70b-instruct:free` |
+| Q2  | Verde    | `.quad-green`  | Motor principal de calidad| `claude-sonnet-5`       |
 | Q3  | Púrpura  | `.quad-purple` | Alternativa libre/rápida  | `deepseek-chat`         |
 | Q4  | Naranja  | `.quad-orange` | Velocidad + Renderizador  | `llama-3.1-70b`         |
 
@@ -96,33 +96,37 @@ El `.vbs` usa `WshShell.Run(..., 0)` para invocar `iniciar.bat` completamente oc
 | Línea aprox. | Módulo / Constante         | Responsabilidad                                              |
 |--------------|----------------------------|--------------------------------------------------------------|
 | 8            | `AppState`                 | Pool de keys en RAM + `pipelineMode` activo. Nunca a disco.  |
-| 16–29        | Constantes globales        | `STORAGE_KEY`, `PBKDF2_ITERATIONS`, límites adjuntos         |
-| 45           | `Crypto`                   | AES-GCM 256 + PBKDF2 via WebCrypto API                       |
-| 101          | `Storage`                  | Leer/guardar blob cifrado en localStorage                    |
-| 111          | `LockScreen`               | Pantalla de desbloqueo con callback `_onUnlock`              |
-| 220          | `SettingsModal`            | Modal 2 pisos: Piso 1 libre (tema+colores), Piso 2 protegido |
-| 633          | `UI`                       | Toast, actualización botón ajustes                           |
-| 675–685      | Constantes API             | `OPENROUTER_URL`, `RETRYABLE_CODES`, `MODEL_404_FALLBACKS`   |
-| 688–696      | System prompts             | `SYSTEM_Q1`, `SYSTEM_ANTI_FLUFF`, `SYSTEM_COMPACTOR`, `CHAIN_FAILURE_PREFIX` |
-| 706          | `QuadrantState`            | Estado por cuadrante: `keyIndex`, `controller`, `history[]`  |
-| 718          | `LED`                      | Semáforos visuales + click handler de rotación manual        |
-| 767          | `Output`                   | Render de burbujas (streaming), mensajes de error/warn       |
-| 859          | `fetchStreamForQuadrant`   | Fetch SSE, retry 429/402, fallback 404, `_DevSim` hook, alimenta `RunLog` |
-| 1060         | `Memory`                   | Ventana móvil: trigger=10, compacta 8, preserva 2            |
-| 1185         | `Pipeline`                 | Flag `active` + botón Cancelar                               |
-| 1205         | `RunLog`                   | Bitácora técnica de la ejecución en curso (errores, modelos, keys) |
-| 1293         | `downloadTechnicalReport()`| Descarga la bitácora de `RunLog` como archivo `.md`          |
-| 1337         | `Orchestrator`             | Fase 1 (Q1) → bifurca Fase 2 en `_runParallel` / `_runChain` según `pipelineMode` |
-| 1676         | `TASK_MATRIX`              | 58 entradas (`default` + `'1'`…`'56'`), 5 grupos             |
-| 4273         | `TaskRouter`               | Aplica TASK_MATRIX al DOM: títulos, selects, `.quad-star`, badge de modo |
-| 4368         | `QuadrantColors`           | Colores personalizados — inline style con `!important`       |
-| 4392         | `Theme`                    | Toggle claro/oscuro — `body.light-theme`                     |
-| 4458         | `Synthesis`                | Panel post-ejecución: comparativa + copy report               |
-| 4552         | `Q4Preview`                | Renderizador SVG/HTML en iframe sandboxed + pestañas         |
-| 4643         | `downloadQ4Render`         | Exportación SVG → PNG/JPG (canvas x2 High-DPI)              |
-| 4720         | `FileAttachments`          | Lectura FileReader UTF-8, badges, drag & drop, inject prompt |
-| 4807         | `newConversation()`        | Reset total: historiales, outputs, LEDs, adjuntos, preview, `RunLog` |
-| 4852         | `DOMContentLoaded`         | Init de todos los módulos y event bindings                   |
+| 16–34        | Constantes globales        | `STORAGE_KEY`, `PBKDF2_ITERATIONS`, `SESSION_SUMMARY_KEY`, límites adjuntos |
+| 48           | `Crypto`                   | AES-GCM 256 + PBKDF2 via WebCrypto API                       |
+| 104          | `Storage`                  | Leer/guardar blob cifrado en localStorage                    |
+| 114          | `LockScreen`               | Pantalla de desbloqueo con callback `_onUnlock`              |
+| 223          | `SettingsModal`            | Modal 2 pisos: Piso 1 libre (tema+colores), Piso 2 protegido. `_save()` llama `KeyPool.reset()` |
+| 637          | `UI`                       | Toast, actualización botón ajustes                           |
+| 679–690      | Constantes API             | `OPENROUTER_URL`, `RETRYABLE_CODES`, `MODEL_404_FALLBACKS`   |
+| 703          | `KeyPool`                  | Enfriamiento de llaves COMPARTIDO entre cuadrantes (429) + set de muertas (402) |
+| 766          | `RequestGate`               | Semáforo de conexiones concurrentes a OpenRouter (cap 2)     |
+| 796 / 817    | `_readRetryAfterMs()` / `_backoffDelay()` | Header `Retry-After` + backoff exponencial con jitter |
+| 822–830      | System prompts             | `SYSTEM_Q1`, `SYSTEM_ANTI_FLUFF`, `SYSTEM_COMPACTOR`, `CHAIN_FAILURE_PREFIX` |
+| 843          | `QuadrantState`            | Estado por cuadrante: `keyIndex`, `controller`, `history[]`  |
+| 855          | `LED`                      | Semáforos visuales + click handler de rotación manual        |
+| 904          | `Output`                   | Render de burbujas (streaming), mensajes de error/warn       |
+| 996          | `fetchStreamForQuadrant`   | Fetch SSE vía `RequestGate`, backoff 429/402 vía `KeyPool`, fallback 404, `_DevSim` hook, alimenta `RunLog` |
+| 1240         | `Memory`                   | Ventana móvil (trigger=10) + compactación serializada globalmente (`_globalLock`/`_pending`) |
+| 1409         | `Pipeline`                 | Flag `active` + botón Cancelar                               |
+| 1429         | `RunLog`                   | Bitácora técnica de la ejecución en curso (errores, modelos, keys) |
+| ~1517        | `downloadTechnicalReport()`| Descarga la bitácora de `RunLog` como archivo `.md`          |
+| 1561         | `Orchestrator`             | Fase 1 (Q1) → bifurca Fase 2 en `_runParallel` / `_runChain` según `pipelineMode` |
+| 1907         | `TASK_MATRIX`              | 58 entradas (`default` + `'1'`…`'56'`), 5 grupos             |
+| 4504         | `TaskRouter`               | Aplica TASK_MATRIX al DOM: títulos, selects, `.quad-star`, badge de modo |
+| 4599         | `QuadrantColors`           | Colores personalizados — inline style con `!important`       |
+| 4623         | `Theme`                    | Toggle claro/oscuro — `body.light-theme`                     |
+| 4689         | `Synthesis`                | Panel post-ejecución: resumen en lenguaje simple + comparativa técnica |
+| 4913         | `Q4Preview`                | Renderizador SVG/HTML en iframe sandboxed + pestañas         |
+| 5004         | `downloadQ4Render`         | Exportación SVG → PNG/JPG (canvas x2 High-DPI)              |
+| 5081         | `FileAttachments`          | Lectura FileReader UTF-8, badges, drag & drop, inject prompt |
+| 5168         | `newConversation()`        | Reset total: historiales, outputs, LEDs, adjuntos, preview, `RunLog`, `SessionBanner` |
+| 5214         | `SessionBanner`            | Muestra resumen de sesión anterior (persistido por `Memory.compact()`) al cargar |
+| 5281         | `DOMContentLoaded`         | Init de todos los módulos y event bindings                   |
 
 ---
 
@@ -136,7 +140,7 @@ rawPrompt
   │         └─ FileAttachments.clear()       ← se vacía tras capturar
   │
   ├─ [si task-select === "auto"]
-  │    └─ Orchestrator._autoDetect(prompt)   ← mini-fetch no-streaming gemini-2.5-flash:free
+  │    └─ Orchestrator._autoDetect(prompt)   ← mini-fetch no-streaming llama-3.3-70b-instruct:free
   │         └─ detecta tarea 1-56 → TaskRouter.apply(n)
   │
   ├─ Pipeline.active = true
@@ -347,7 +351,7 @@ Descarga:
 Todas las tareas 1–56 usan `pipelineMode: 'chain'`; `default` usa `pipelineMode: 'parallel'`.
 
 ### Auto-detección semántica (`value="auto"`)
-- Mini-fetch no-streaming a `google/gemini-2.5-flash:free`
+- Mini-fetch no-streaming a `meta-llama/llama-3.3-70b-instruct:free`
 - System prompt: lista completa 1-56 + instrucción "responde solo con el número"
 - Respuesta parseada como `parseInt` → `TaskRouter.apply(n)`
 - Si falla: fallback a `'default'`, toast de aviso
@@ -436,7 +440,7 @@ Lógica en DOMContentLoaded:
 | TASK_MATRIX 56 tareas | ✅ Completo | 5 grupos, modelos óptimos por tarea |
 | Pipeline en Cadena | ✅ Completo | `_runChain()`: Q2→Q3→Q4 secuencial, contexto acumulado, degradación elegante en fallo |
 | Buscador predictivo | ✅ Completo | Filtra options/optgroups en tiempo real |
-| Auto-detect semántico | ✅ Completo | gemini-2.5-flash → tarea 1-56 |
+| Auto-detect semántico | ✅ Completo | llama-3.3-70b-instruct:free → tarea 1-56 |
 | Adjuntos de archivo | ✅ Completo | FileReader UTF-8, drag & drop, badges |
 | Síntesis post-ejecución | ✅ Completo | Colapsable, copy to clipboard |
 | Nueva Conversación | ✅ Completo | Reset total sin tocar keys/prefs |
@@ -469,6 +473,7 @@ Lógica en DOMContentLoaded:
 | `nav_ia_keys_enc` | JSON `{salt, iv, data}` Base64 | Keys cifradas AES-GCM |
 | `navia_theme` | `'light'` \| `'dark'` | Tema activo |
 | `navia_q1_color` … `navia_q4_color` | `#rrggbb` | Color personalizado de cuadrante |
+| `navia_session_summary` | JSON `{ q1, q2, q3, q4, lastRun }` | Resumen compactado por cuadrante (`Memory.compact()`), usado por `SessionBanner`. Solo texto semántico — nunca respuestas completas ni keys. |
 
 ### Variables globales volátiles (RAM)
 
@@ -543,7 +548,66 @@ Checklist:
 
 ## 14. Changelog
 
-### v1.4.1 — Julio 2026 *(sesión actual)*
+### v1.4.4 — Julio 2026 *(sesión actual)*
+- **[NEW] Blindaje anti-RateLimit (429/402)** — hasta 6 peticiones podían dispararse en
+  milisegundos (Fase 1 + Fase 2 en paralelo + compactación de fondo) sin ningún estado
+  compartido entre cuadrantes, causando colapso por 429 y desperdicio de intentos en 402:
+  - `KeyPool`: enfriamiento de llaves **compartido globalmente** — si Q2 quema una llave
+    con 429, Q3/Q4 la evitan automáticamente en vez de descubrirlo por su cuenta.
+    Las llaves con 402 (sin saldo) se marcan muertas por sesión (no se reintentan).
+  - `RequestGate`: semáforo de conexiones concurrentes (cap 2) — suaviza la ráfaga inicial
+    de peticiones sin importar el origen (stream, compactación, autodetect). Se libera al
+    recibir headers, así que el streaming en sí sigue en paralelo.
+  - `_readRetryAfterMs()` / `_backoffDelay()`: respeta el header `Retry-After` de OpenRouter
+    cuando existe; si no, backoff exponencial con jitter (antes: 400ms fijo siempre).
+  - `fetchStreamForQuadrant()`: 402 y 429 ahora se manejan por separado — 402 descarta la
+    llave sin backoff exponencial (no tiene sentido reintentarla), 429 sí lo aplica.
+  - `Memory.compact()`: serializada globalmente (`_globalLock` + cola `_pending` con dedup)
+    — antes las 3 compactaciones podían dispararse a la vez sobre la misma llave de Q1.
+    `_callCompactor()` ahora usa una llave disponible del pool, no la fija de Q1.
+  - `Orchestrator._autoDetect()`: enrutado por `KeyPool`/`RequestGate`; corregido un bug del
+    diseño original donde, si la primera llave se enfriaba a mitad del loop de modelos, los
+    intentos siguientes seguían usando esa misma llave en vez de re-elegir una viva.
+  - `KeyPool.reset()` se llama al guardar un set nuevo de llaves en `SettingsModal._save()`.
+  - Verificado en vivo con `window.simulateNetworkError`: un 429 en Q1 produce
+    `"Llave 1 enfriada 5000ms → backoff 904ms"` (antes: siempre 400ms fijo), confirma
+    rotación de llave y aborta el pipeline limpiamente sin excepciones JS.
+
+### v1.4.3 — Julio 2026
+- **[FIX CRÍTICO]** OpenRouter renovó su catálogo de modelos desde que se construyó
+  `TASK_MATRIX` — 8 de los IDs usados ya no existen, causando 404 en cascada (confirmado
+  contra `GET /api/v1/models` en vivo, no por prueba y error):
+  - `anthropic/claude-3.5-sonnet` (retirado) → `anthropic/claude-sonnet-5`
+  - `google/gemini-2.5-flash:free` (el sufijo `:free` fue retirado) → `meta-llama/llama-3.3-70b-instruct:free`
+  - `google/gemini-2.0-flash-exp:free` (retirado) → `openai/gpt-oss-120b:free`
+  - `qwen/qwen-2.5-coder-32b-instruct:free` (sufijo `:free` retirado) → `qwen/qwen3-coder:free`
+  - `meta-llama/llama-3.1-8b-instruct:free` (sufijo `:free` retirado) → `meta-llama/llama-3.2-3b-instruct:free`
+  - `qwen/qwen-2.5-72b-instruct:free` (sufijo `:free` retirado) → `openai/gpt-oss-20b:free`
+  - `meta-llama/llama-3-8b-instruct:free`, `google/gemma-2-27b-it:free` (retirados, solo en selects de `index.html`) → reemplazados
+  - Corregidos: las 56 entradas de `TASK_MATRIX` (id + label juntos, no solo el id),
+    `MODEL_404_FALLBACKS`, `_autoDetect()`, `_generatePlainSummary()`, y los 4 `<select>`
+    de `index.html`. `openai/gpt-4o`, `meta-llama/llama-3.1-70b-instruct` y
+    `deepseek/deepseek-chat` se confirmaron vigentes — sin cambios.
+- **[HARDEN]** `MODEL_404_FALLBACKS[3]` (Q3) ahora termina en `deepseek/deepseek-chat` (pago,
+  estable) — era el único cuadrante cuya cadena completa de fallback era 100% modelos
+  `:free`, y fue el que se quedó sin alternativas cuando OpenRouter rotó su catálogo free.
+  Los otros 3 cuadrantes ya tenían esta protección.
+
+### v1.4.2 — Julio 2026
+- **[NEW]** `SessionBanner`: al recargar la app, si hay resúmenes compactados persistidos
+  en `navia_session_summary`, muestra un banner colapsable bajo el navbar con lo trabajado
+  en la sesión anterior por cuadrante. `Memory.compact()` ahora persiste cada resumen
+  semántico (nunca el texto crudo ni keys). Se limpia en `newConversation()`.
+- **[UX]** El textarea del prompt se limpia inmediatamente al enviar (Enter o botón
+  Ejecutar), antes de que responda el pipeline — ya no hay que borrarlo manualmente.
+- **[UX]** Panel de Síntesis: la vista principal ahora es un resumen en lenguaje simple
+  (mini-fetch a Gemini Flash, en segundo plano) en vez de fragmentos técnicos crudos.
+  La comparativa por cuadrante se mantiene debajo, más compacta, como referencia.
+- **[NEW]** Botón "📊 Reportes" unifica en un menú desplegable las dos acciones que antes
+  eran botones separados: "📋 Copiar Respuestas de las IAs" y "🩺 Reporte Técnico de
+  Diagnóstico (.md)" — evita la ambigüedad de dos botones con nombres casi idénticos.
+
+### v1.4.1 — Julio 2026
 - **[NEW]** Botón `🩺 Generar Reporte Técnico` en el panel de Síntesis
   - Módulo `RunLog`: bitácora de eventos de diagnóstico por cuadrante durante cada ejecución
     (rotaciones de key, fallbacks de modelo, errores HTTP/red, degradación de cadena, éxitos)

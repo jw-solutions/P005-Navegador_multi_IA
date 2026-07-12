@@ -19,6 +19,9 @@ const PBKDF2_ITERATIONS = 200_000;
 const MIN_KEYS          = 3;
 const TOTAL_KEY_SLOTS   = 5;
 
+// Clave para persistir el resumen compactado de sesión entre recargas
+const SESSION_SUMMARY_KEY = 'navia_session_summary';
+
 // ── Entorno ────────────────────────────────────────────────────
 // Cambiar a `true` antes de cualquier despliegue a producción.
 // Efecto: deshabilita DevSim, no expone herramientas de test en `window`.
@@ -604,6 +607,7 @@ const SettingsModal = {
       Storage.save(encrypted);
       AppState.apiKeys    = keys;
       AppState.isUnlocked = true;
+      KeyPool.reset(); // set de llaves nuevo → limpiar enfriamientos y muertas previas
       this.close();
       UI.updateSettingsBtn();
       UI.toast(`✅ ${keys.length} llaves cifradas y guardadas con AES-256.`);
@@ -678,11 +682,144 @@ const RETRYABLE_CODES  = new Set([429, 402]);
 // Modelos de fallback por cuadrante cuando el modelo preferido devuelve 404.
 // El orden importa: se prueban de izquierda a derecha hasta encontrar uno activo.
 const MODEL_404_FALLBACKS = {
-  1: ['google/gemini-2.0-flash-exp:free', 'meta-llama/llama-3.1-70b-instruct', 'deepseek/deepseek-chat'],
+  1: ['openai/gpt-oss-120b:free', 'meta-llama/llama-3.1-70b-instruct', 'deepseek/deepseek-chat'],
   2: ['deepseek/deepseek-chat', 'meta-llama/llama-3.1-70b-instruct'],
-  3: ['meta-llama/llama-3.1-8b-instruct:free', 'qwen/qwen-2.5-72b-instruct:free'],
-  4: ['meta-llama/llama-3.1-8b-instruct:free', 'deepseek/deepseek-chat'],
+  // Termina en un modelo de pago verificado — Q3 fue el único cuadrante que se
+  // quedó sin alternativas cuando OpenRouter retiró sus modelos ":free" (v1.4.3).
+  3: ['meta-llama/llama-3.2-3b-instruct:free', 'openai/gpt-oss-20b:free', 'deepseek/deepseek-chat'],
+  4: ['meta-llama/llama-3.2-3b-instruct:free', 'deepseek/deepseek-chat'],
 };
+
+// ============================================================
+// CONTROL DE CONCURRENCIA Y ENFRIAMIENTO GLOBAL DE LLAVES
+//
+// KeyPool     : registro de enfriamiento COMPARTIDO por todos los cuadrantes.
+//               Si una llave recibe 429, queda fría para TODA la app.
+//               Las llaves con 402 (sin saldo) se marcan muertas por sesión.
+// RequestGate : semáforo que limita conexiones concurrentes a OpenRouter.
+//               Suaviza la ráfaga sin importar el origen (stream/compact/autodetect).
+//               Se libera al recibir headers → el streaming sigue en paralelo.
+// ============================================================
+const KeyPool = {
+  _cooldownUntil: [], // timestamp ms de fin de enfriamiento, alineado por índice
+  _dead: new Set(),   // índices con 402 — descartados hasta re-guardar llaves
+
+  // Ajusta el array de enfriamientos al tamaño actual del pool
+  sync() {
+    const n = AppState.apiKeys.length;
+    if (this._cooldownUntil.length !== n) {
+      this._cooldownUntil = Array.from({ length: n }, (_, i) => this._cooldownUntil[i] ?? 0);
+    }
+  },
+
+  isAvailable(idx) {
+    if (this._dead.has(idx)) return false;
+    return Date.now() >= (this._cooldownUntil[idx] ?? 0);
+  },
+
+  // Primer índice disponible desde `from` (circular), o null si ninguno
+  pick(from = 0) {
+    this.sync();
+    const n = AppState.apiKeys.length;
+    if (n === 0) return null;
+    for (let i = 0; i < n; i++) {
+      const idx = ((from % n) + i) % n;
+      if (this.isAvailable(idx)) return idx;
+    }
+    return null;
+  },
+
+  markRateLimited(idx, ms = 5000) {
+    this.sync();
+    this._cooldownUntil[idx] = Date.now() + ms;
+  },
+
+  markDead(idx) {
+    this._dead.add(idx);
+  },
+
+  // ms hasta que la primera llave viva salga de enfriamiento.
+  //  0  → hay una disponible ya
+  // >0  → hay que esperar ese tiempo
+  // -1  → todas muertas (402), no hay nada que esperar
+  soonestAvailableMs() {
+    this.sync();
+    const n = AppState.apiKeys.length;
+    const now = Date.now();
+    let soonest = Infinity;
+    for (let idx = 0; idx < n; idx++) {
+      if (this._dead.has(idx)) continue;
+      const t = this._cooldownUntil[idx] ?? 0;
+      if (now >= t) return 0;
+      soonest = Math.min(soonest, t - now);
+    }
+    return soonest === Infinity ? -1 : soonest;
+  },
+
+  // Limpia todo — llamar al re-guardar un set nuevo de llaves
+  reset() {
+    this._cooldownUntil = [];
+    this._dead.clear();
+  },
+};
+
+const RequestGate = {
+  max: 2,        // conexiones concurrentes máximas a OpenRouter (ajustable)
+  _active: 0,
+  _queue: [],
+
+  acquire() {
+    return new Promise(resolve => {
+      if (this._active < this.max) {
+        this._active++;
+        resolve();
+      } else {
+        this._queue.push(resolve);
+      }
+    });
+  },
+
+  release() {
+    const next = this._queue.shift();
+    if (next) next();        // ceder el permiso sin decrementar
+    else this._active--;
+  },
+
+  async run(fn) {
+    await this.acquire();
+    try { return await fn(); }
+    finally { this.release(); }
+  },
+};
+
+// Lee Retry-After (segundos) o X-RateLimit-Reset del response. Devuelve ms o null.
+function _readRetryAfterMs(response) {
+  try {
+    const ra = response.headers?.get?.('retry-after');
+    if (ra) {
+      const secs = parseInt(ra, 10);
+      if (!isNaN(secs)) return Math.min(secs * 1000, 30000);
+    }
+    const reset = response.headers?.get?.('x-ratelimit-reset');
+    if (reset) {
+      const val = parseInt(reset, 10);
+      if (!isNaN(val)) {
+        // Puede venir como epoch-ms o como segundos relativos
+        const delta = val > 1e12 ? val - Date.now() : val * 1000;
+        if (delta > 0) return Math.min(delta, 30000);
+      }
+    }
+  } catch { /* headers no disponibles (ej. respuesta simulada) */ }
+  return null;
+}
+
+// Backoff exponencial con jitter. attempt = 1,2,3... Respeta Retry-After. Cap 20s.
+function _backoffDelay(attempt, retryAfterMs) {
+  if (retryAfterMs) return retryAfterMs + Math.random() * 300;
+  const base = 600;
+  const exp  = base * Math.pow(2, Math.min(attempt - 1, 5));
+  return Math.min(exp + Math.random() * 400, 20000);
+}
 
 // System prompt inyectado en Q1 (Compresor de Prompt)
 const SYSTEM_Q1 = `Eres un Compresor de Prompts de IA. Tu única tarea es analizar la petición del usuario, eliminar saludos, cortesías y redundancias, y reescribir la instrucción en un formato puramente técnico, directo y optimizado para que otros LLMs lo entiendan con el menor consumo de tokens posible. Devuelve SOLO la instrucción optimizada, sin preámbulos.`;
@@ -865,37 +1002,63 @@ async function fetchStreamForQuadrant(qId, messages) {
     return null;
   }
 
-  // Cancela cualquier fetch previo de este cuadrante
+  KeyPool.sync();
   QuadrantState[qId].controller?.abort();
 
   Output.clear(qId);
   LED.set(qId, 'loading');
 
-  // Acumulador: construye el texto completo mientras llegan los tokens
-  let fullText     = '';
-  let attemptsLeft = total;
-  let _modelFbIdx  = -1; // -1 = modelo del <select>; >=0 = MODEL_404_FALLBACKS[qId][idx]
+  let fullText      = '';
+  let fetchAttempts = 0;
+  let waitCycles    = 0;
+  const MAX_FETCH   = total * 2; // margen para reintentos con enfriamiento
+  const MAX_WAITS   = 4;         // ciclos de espera antes de rendirse
+  let _modelFbIdx   = -1;        // -1 = modelo del <select>; >=0 = MODEL_404_FALLBACKS[qId][idx]
 
-  while (attemptsLeft > 0) {
-    const keyIdx  = QuadrantState[qId].keyIndex;
-    const key     = AppState.apiKeys[keyIdx];
-    const _fbs    = MODEL_404_FALLBACKS[qId] ?? [];
-    const model   = (_modelFbIdx >= 0 && _fbs[_modelFbIdx])
-                    ? _fbs[_modelFbIdx]
-                    : getModelId(qId);
+  while (fetchAttempts < MAX_FETCH) {
+
+    // ── Resolver llave disponible (salta frías y muertas, GLOBAL) ──
+    const keyIdx = KeyPool.pick(QuadrantState[qId].keyIndex);
+    if (keyIdx === null) {
+      const waitMs = KeyPool.soonestAvailableMs();
+      if (waitMs === -1) { // todas muertas por 402
+        LED.set(qId, 'error');
+        Output.renderMsg(qId, `❌ Todas las llaves sin saldo (402). Añade llaves nuevas en ⚙️ Ajustes.`, 'error');
+        RunLog.log(qId, 'error', '❌ Todas las llaves sin saldo (402).');
+        return null;
+      }
+      if (++waitCycles > MAX_WAITS) {
+        LED.set(qId, 'error');
+        Output.renderMsg(qId, `❌ Pool en enfriamiento prolongado. Espera unos segundos y reintenta.`, 'error');
+        RunLog.log(qId, 'error', '❌ Pool en enfriamiento prolongado tras varios ciclos de espera.');
+        return null;
+      }
+      const capped = Math.min(waitMs + Math.random() * 250, 15000);
+      Output.renderMsg(qId, `⏸ Todas las llaves enfriándose. Esperando ${Math.round(capped)}ms…`, 'warn');
+      RunLog.log(qId, 'warn', `⏸ Todas las llaves enfriándose. Esperando ${Math.round(capped)}ms.`);
+      await delay(capped);
+      LED.set(qId, 'loading');
+      continue;
+    }
+    QuadrantState[qId].keyIndex = keyIdx;
+    fetchAttempts++;
+
+    const key   = AppState.apiKeys[keyIdx];
+    const _fbs  = MODEL_404_FALLBACKS[qId] ?? [];
+    const model = (_modelFbIdx >= 0 && _fbs[_modelFbIdx]) ? _fbs[_modelFbIdx] : getModelId(qId);
 
     const controller = new AbortController();
     QuadrantState[qId].controller = controller;
 
-    // ── Petición HTTP ──────────────────────────────────────────
+    // ── Conexión bajo semáforo (limita ráfaga de RPS) ──────────
     // [DEV] Si hay un error simulado pendiente lo usamos sin llamar a la red real.
     const _simCode = _DevSim.consume(qId);
     let response;
     if (_simCode !== null) {
-      response = { ok: false, status: _simCode, statusText: 'Simulado por DevTools' };
+      response = { ok: false, status: _simCode, statusText: 'Simulado por DevTools', headers: { get: () => null } };
     } else {
       try {
-        response = await fetch(OPENROUTER_URL, {
+        response = await RequestGate.run(() => fetch(OPENROUTER_URL, {
           method: 'POST',
           headers: {
             'Authorization': `Bearer ${key}`,
@@ -905,7 +1068,7 @@ async function fetchStreamForQuadrant(qId, messages) {
           },
           body: JSON.stringify({ model, messages, stream: true }),
           signal: controller.signal,
-        });
+        }));
       } catch (err) {
         if (err.name === 'AbortError') return null; // cancelado intencionalmente por Pipeline.abort()
         LED.set(qId, 'error');
@@ -915,25 +1078,41 @@ async function fetchStreamForQuadrant(qId, messages) {
       }
     }
 
-    // ── 429 Rate Limit / 402 Sin Saldo → rotar llave ──────────
-    if (RETRYABLE_CODES.has(response.status)) {
-      const reason = response.status === 429 ? 'Rate Limit (429)' : 'Sin Saldo (402)';
-      const nextKeyIdx = (keyIdx + 1) % total;
+    // ── 429 Rate Limit → enfriar llave GLOBALMENTE + backoff ───
+    if (response.status === 429) {
+      const retryAfter = _readRetryAfterMs(response);
+      const cooldown    = retryAfter ?? 5000;
+      KeyPool.markRateLimited(keyIdx, cooldown); // fría para TODOS los cuadrantes
+
+      const backoff = _backoffDelay(fetchAttempts, retryAfter);
       console.log(
-        `%c[NavIA] Q${qId} ❌ ${reason} — Llave ${keyIdx + 1} falló → rotando a Llave ${nextKeyIdx + 1}`,
+        `%c[NavIA] Q${qId} 429 — Llave ${keyIdx + 1} enfriada ${cooldown}ms → backoff ${Math.round(backoff)}ms`,
         'color:#ef4444; font-weight:bold'
       );
-      Output.renderMsg(qId, `⚠ Llave ${keyIdx + 1}: ${reason}. Rotando automáticamente…`, 'warn');
-      RunLog.log(qId, 'warn', `⚠ Llave ${keyIdx + 1}: ${reason}. Rotando a llave ${nextKeyIdx + 1}. Modelo: ${model}`);
+      Output.renderMsg(qId, `⚠ Llave ${keyIdx + 1}: Rate Limit (429). Enfriando y reintentando en ${Math.round(backoff)}ms…`, 'warn');
+      RunLog.log(qId, 'warn', `⚠ Llave ${keyIdx + 1}: Rate Limit (429). Enfriada ${cooldown}ms, backoff ${Math.round(backoff)}ms. Modelo: ${model}`);
       LED.set(qId, 'error');
 
       QuadrantState[qId].keyIndex = (keyIdx + 1) % total;
-      attemptsLeft--;
+      await delay(backoff);
+      LED.set(qId, 'loading');
+      continue;
+    }
 
-      if (attemptsLeft > 0) {
-        await delay(400);
-        LED.set(qId, 'loading');
-      }
+    // ── 402 Sin Saldo → llave muerta por sesión (no exponencial) ──
+    if (response.status === 402) {
+      KeyPool.markDead(keyIdx);
+      console.log(
+        `%c[NavIA] Q${qId} 402 — Llave ${keyIdx + 1} sin saldo → descartada (muerta por sesión)`,
+        'color:#ef4444; font-weight:bold'
+      );
+      Output.renderMsg(qId, `⚠ Llave ${keyIdx + 1}: Sin Saldo (402). Descartada. Probando otra…`, 'warn');
+      RunLog.log(qId, 'warn', `⚠ Llave ${keyIdx + 1}: Sin Saldo (402). Descartada por sesión. Modelo: ${model}`);
+      LED.set(qId, 'error');
+
+      QuadrantState[qId].keyIndex = (keyIdx + 1) % total;
+      await delay(300 + Math.random() * 200); // respiro corto, no backoff
+      LED.set(qId, 'loading');
       continue;
     }
 
@@ -944,9 +1123,10 @@ async function fetchStreamForQuadrant(qId, messages) {
         _modelFbIdx = nextIdx;
         Output.renderMsg(qId, `⚠ Modelo no disponible (404). Probando alternativo: ${_fbs[nextIdx]}…`, 'warn');
         RunLog.log(qId, 'warn', `⚠ Modelo ${model} no disponible (404). Probando alternativo: ${_fbs[nextIdx]}`);
+        fetchAttempts--; // el problema es el modelo, no la llave: no consumir intento
         await delay(400);
         LED.set(qId, 'loading');
-        continue; // no decrementa attemptsLeft — el problema es el modelo, no la llave
+        continue;
       }
       LED.set(qId, 'error');
       Output.renderMsg(qId, `❌ Modelo no encontrado (404) y sin más alternativas para Q${qId}.`, 'error');
@@ -962,7 +1142,7 @@ async function fetchStreamForQuadrant(qId, messages) {
       return null;
     }
 
-    // ── Streaming SSE exitoso ──────────────────────────────────
+    // ── Streaming SSE (ya fuera del semáforo: conexión establecida) ──
     LED.set(qId, 'streaming');
     console.log(
       `%c[NavIA] Q${qId} ▶ Stream iniciado — modelo: ${model} — Llave ${keyIdx + 1}/${total}`,
@@ -1022,14 +1202,14 @@ async function fetchStreamForQuadrant(qId, messages) {
     return fullText; // ✅ Éxito — devuelve el texto completo al orquestador
   }
 
-  // Pool agotado: ninguna llave funcionó
+  // Intentos de fetch agotados
   LED.set(qId, 'error');
   Output.renderMsg(
     qId,
-    `❌ Pool agotado: las ${total} llaves fallaron con 429/402. Añade llaves nuevas en ⚙️ Ajustes.`,
+    `❌ Pool saturado: reintentos agotados tras enfriamientos sucesivos. Espera unos segundos y reintenta.`,
     'error'
   );
-  RunLog.log(qId, 'error', `❌ Pool agotado: las ${total} llaves fallaron con 429/402.`);
+  RunLog.log(qId, 'error', '❌ Pool saturado: reintentos agotados tras enfriamientos sucesivos.');
   return null;
 }
 
@@ -1063,6 +1243,8 @@ const Memory = {
 
   // Flags anti-doble-compactación por cuadrante (evita race conditions)
   _compacting: { 1: false, 2: false, 3: false, 4: false },
+  _globalLock: false, // solo UNA compactación a la vez en toda la app
+  _pending:    [],     // cola de qId esperando turno (con dedup)
 
   // Inicializa (o reinicia) los historiales con el system prompt base de cada cuadrante.
   // Se llama en DOMContentLoaded; puede llamarse de nuevo para empezar sesión nueva.
@@ -1092,10 +1274,14 @@ const Memory = {
   },
 
   /**
-   * Compactación semántica en segundo plano.
+   * Compactación semántica en segundo plano, SERIALIZADA.
+   *
+   * Si ya hay una compactación en curso en cualquier cuadrante, este se encola
+   * (sin duplicar) y se procesa cuando la actual termina. Nunca corren dos a la
+   * vez → no hay pileup de peticiones sobre el endpoint del compactador.
    *
    * 1. Extrae los primeros (TRIGGER - KEEP) mensajes del array (los más antiguos).
-   * 2. Los envía al modelo del Q1 como texto plano (una llamada no-streaming directa).
+   * 2. Los envía a una llave disponible del pool como texto plano (no-streaming).
    * 3. Con el resumen recibido, reconstruye el historial:
    *      [{ system: '[Contexto Compactado]: …resumen…' }, …2_recientes… ]
    * 4. Si la llamada falla, el historial queda intacto y se reintenta en el
@@ -1105,46 +1291,80 @@ const Memory = {
    */
   async compact(qId) {
     if (this._compacting[qId]) return;
+
+    // Serializar: si el ecosistema está compactando, encolar y salir
+    if (this._globalLock) {
+      if (!this._pending.includes(qId)) this._pending.push(qId);
+      return;
+    }
+
+    this._globalLock      = true;
     this._compacting[qId] = true;
 
-    const history = QuadrantState[qId].history;
-    const batchSize = this.TRIGGER - this.KEEP; // 8
+    try {
+      const history   = QuadrantState[qId].history;
+      const batchSize = this.TRIGGER - this.KEEP; // 8
+      const batch     = history.slice(0, batchSize); // los 8 más antiguos
+      const recent    = history.slice(batchSize);    // los 2 más recientes
 
-    const batch  = history.slice(0, batchSize); // los 8 más antiguos
-    const recent = history.slice(batchSize);    // los 2 más recientes
+      Output.renderCompactionNote(qId);
 
-    Output.renderCompactionNote(qId);
+      const summary = await this._callCompactor(batch);
 
-    const summary = await this._callCompactor(batch);
+      if (summary !== null) {
+        // Sustituir historial: contexto compactado + 2 recientes
+        QuadrantState[qId].history = [
+          {
+            role:    'system',
+            content: `[Contexto Semántico Compactado de la Sesión]: ${summary}`,
+          },
+          ...recent,
+        ];
 
-    if (summary !== null) {
-      // Sustituir historial: contexto compactado + 2 recientes
-      QuadrantState[qId].history = [
-        {
-          role:    'system',
-          content: `[Contexto Semántico Compactado de la Sesión]: ${summary}`,
-        },
-        ...recent,
-      ];
+        // Persistir el resumen compactado para mostrarlo al recargar la app
+        try {
+          const existing = JSON.parse(localStorage.getItem(SESSION_SUMMARY_KEY) ?? '{}');
+          existing[`q${qId}`] = summary;
+          existing.lastRun = new Date().toLocaleString('es-ES', {
+            day: '2-digit', month: '2-digit', year: 'numeric',
+            hour: '2-digit', minute: '2-digit',
+          });
+          localStorage.setItem(SESSION_SUMMARY_KEY, JSON.stringify(existing));
+        } catch { /* non-critical */ }
+      }
+      // Si summary === null (fallo de red / API o sin llave viva), el historial queda como estaba
+    } catch (err) {
+      console.error(`[Memory] Error compactando Q${qId}:`, err);
+    } finally {
+      this._compacting[qId] = false;
+      this._globalLock      = false;
+
+      // Procesar el siguiente en cola, si aún lo necesita
+      const nextQid = this._pending.shift();
+      if (nextQid !== undefined && this.shouldCompact(nextQid)) {
+        setTimeout(() => this.compact(nextQid), 500); // respiro entre compactaciones
+      }
     }
-    // Si summary === null (fallo de red / API), el historial queda como estaba
-
-    this._compacting[qId] = false;
   },
 
   /**
    * Llamada directa NO-STREAMING a OpenRouter para generar el resumen.
-   * Usa el modelo activo en Q1 y la llave actual del pool.
+   * Usa el modelo activo en Q1 pero una LLAVE DISPONIBLE del pool (no la fija
+   * de Q1), y pasa por RequestGate para no sumar ráfaga.
    *
    * Los mensajes del batch se serializan como texto plano (un único mensaje de
    * usuario) para evitar conflictos de roles múltiples con la API.
    *
-   * Retorna: string (resumen) | null (si falló)
+   * Retorna: string (resumen) | null (si falló o no hay llave viva)
    */
   async _callCompactor(batch) {
-    const key   = AppState.apiKeys[QuadrantState[1].keyIndex];
     const model = getModelId(1);
-    if (!key || !model) return null;
+    if (!model) return null;
+
+    const keyIdx = KeyPool.pick(QuadrantState[1].keyIndex);
+    if (keyIdx === null) return null; // todas frías/muertas: abortar, se reintenta luego
+    const key = AppState.apiKeys[keyIdx];
+    if (!key) return null;
 
     // Serializar el batch como bloque de texto legible
     const historyText = batch
@@ -1152,7 +1372,7 @@ const Memory = {
       .join('\n\n---\n\n');
 
     try {
-      const res = await fetch(OPENROUTER_URL, {
+      const res = await RequestGate.run(() => fetch(OPENROUTER_URL, {
         method:  'POST',
         headers: {
           'Authorization': `Bearer ${key}`,
@@ -1168,9 +1388,13 @@ const Memory = {
             { role: 'user',   content: historyText },
           ],
         }),
-      });
+      }));
 
+      // Propagar estado de la llave al pool global
+      if (res.status === 429) { KeyPool.markRateLimited(keyIdx, _readRetryAfterMs(res) ?? 5000); return null; }
+      if (res.status === 402) { KeyPool.markDead(keyIdx); return null; }
       if (!res.ok) return null;
+
       const data = await res.json();
       return data.choices?.[0]?.message?.content?.trim() ?? null;
     } catch {
@@ -1618,12 +1842,17 @@ const Orchestrator = {
 
     const sysPrompt = `Eres un clasificador de tareas. Analiza el prompt del usuario y responde ÚNICAMENTE con el número (1-56) de la tarea más apropiada de esta lista:\n${TASK_LIST}\nResponde SOLO con el número, sin explicación, sin puntos, sin texto adicional.`;
 
-    const models = ['google/gemini-2.5-flash:free', ...(MODEL_404_FALLBACKS[1] ?? [])];
-    const key = AppState.apiKeys[QuadrantState[1].keyIndex % AppState.apiKeys.length];
+    const models = ['meta-llama/llama-3.3-70b-instruct:free', ...(MODEL_404_FALLBACKS[1] ?? [])];
 
     for (const model of models) {
+      // Re-elegir llave en CADA modelo: si la anterior quedó fría/muerta por un
+      // 429/402 en este mismo loop, no insistir con ella para el siguiente intento.
+      const keyIdx = KeyPool.pick(QuadrantState[1].keyIndex);
+      if (keyIdx === null) return null; // sin llave viva: usar 'default' aguas arriba
+      const key = AppState.apiKeys[keyIdx];
+
       try {
-        const resp = await fetch(OPENROUTER_URL, {
+        const resp = await RequestGate.run(() => fetch(OPENROUTER_URL, {
           method: 'POST',
           headers: {
             'Authorization': `Bearer ${key}`,
@@ -1639,8 +1868,10 @@ const Orchestrator = {
             ],
             max_tokens: 10,
           }),
-        });
+        }));
 
+        if (resp.status === 429) { KeyPool.markRateLimited(keyIdx, _readRetryAfterMs(resp) ?? 5000); continue; }
+        if (resp.status === 402) { KeyPool.markDead(keyIdx); continue; }
         if (!resp.ok) continue;
 
         const json = await resp.json();
@@ -1682,7 +1913,7 @@ const TASK_MATRIX = {
     q2: {
       title: '🤖 Motor Avanzado',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
         { id: 'openai/gpt-4o',               label: 'GPT-4o' },
       ],
       role: 'Respuesta de calidad general',
@@ -1691,7 +1922,7 @@ const TASK_MATRIX = {
       title: '💡 Alternativa Gratis',
       models: [
         { id: 'deepseek/deepseek-chat',        label: 'DeepSeek Chat' },
-        { id: 'qwen/qwen-2.5-coder-32b-instruct:free',  label: 'Qwen 2.5 Coder Free' },
+        { id: 'qwen/qwen3-coder:free',  label: 'Qwen3 Coder Free' },
       ],
       role: 'Perspectiva alternativa',
     },
@@ -1699,7 +1930,7 @@ const TASK_MATRIX = {
       title: '🚀 Contrapeso de Velocidad',
       models: [
         { id: 'meta-llama/llama-3.1-70b-instruct', label: 'Llama 3.1 70B' },
-        { id: 'google/gemini-2.5-flash:free',       label: 'Gemini 2.5 Flash Free' },
+        { id: 'meta-llama/llama-3.3-70b-instruct:free',       label: 'Llama 3.3 70B Free' },
       ],
       role: 'Respuesta rápida de contraste',
     },
@@ -1717,7 +1948,7 @@ const TASK_MATRIX = {
     q2: {
       title: '🤖 Arquitecto Python',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Diseña la lógica, estructura de funciones y manejo de errores',
       chainSystemPrompt: `Eres el Arquitecto de este pipeline de desarrollo Python.
@@ -1729,7 +1960,7 @@ Sin saludos. Directo al diseño técnico.`,
     q3: {
       title: '💡 Implementador Qwen',
       models: [
-        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder (Top)' },
+        { id: 'qwen/qwen3-coder:free', label: 'Qwen3 Coder Free' },
         { id: 'deepseek/deepseek-chat',        label: 'DeepSeek Chat' },
       ],
       role: 'Implementa el diseño de Q2 en código Python completo',
@@ -1741,7 +1972,7 @@ Entrega el script listo para ejecutar. Sin texto adicional fuera del código y s
     q4: {
       title: '🚀 QA y Tests',
       models: [
-        { id: 'google/gemini-2.5-flash:free', label: 'Gemini 2.5 Flash Free' },
+        { id: 'meta-llama/llama-3.3-70b-instruct:free', label: 'Llama 3.3 70B Free' },
       ],
       role: 'Detecta bugs en el código de Q3 y genera test cases',
       chainSystemPrompt: `Eres el QA de este pipeline. Recibirás el código Python implementado por el cuadrante anterior.
@@ -1759,7 +1990,7 @@ Produce: (1) lista de issues encontrados con línea aproximada, (2) versión cor
     q2: {
       title: '🤖 Diagnosticador',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
         { id: 'openai/gpt-4o',               label: 'GPT-4o' },
       ],
       role: 'Analiza el bug y traza la causa raíz',
@@ -1772,7 +2003,7 @@ Tu output será usado por un modelo especializado en código para escribir el fi
     q3: {
       title: '💡 Cirujano de Código',
       models: [
-        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen3-coder:free', label: 'Qwen3 Coder Free' },
       ],
       role: 'Produce el fix exacto basado en el diagnóstico de Q2',
       chainSystemPrompt: `Eres el Cirujano de este pipeline. Recibirás el diagnóstico del cuadrante anterior.
@@ -1801,7 +2032,7 @@ Produce: (1) confirmación o refutación del fix, (2) riesgos de regresión iden
     q2: {
       title: '🤖 Auditor de Deuda Técnica',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Identifica todos los problemas del código actual',
       chainSystemPrompt: `Eres el Auditor de deuda técnica de este pipeline.
@@ -1813,7 +2044,7 @@ Sé específico con líneas o funciones. Tu informe será la guía del refactori
     q3: {
       title: '💡 Refactorizador',
       models: [
-        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen3-coder:free', label: 'Qwen3 Coder Free' },
       ],
       role: 'Produce el código refactorizado completo basado en la auditoría de Q2',
       chainSystemPrompt: `Eres el Refactorizador de este pipeline. Recibirás la auditoría de deuda técnica del cuadrante anterior.
@@ -1824,7 +2055,7 @@ Usa comentarios inline solo donde la decisión de diseño no sea obvia.`,
     q4: {
       title: '🚀 Documentador',
       models: [
-        { id: 'google/gemini-2.5-flash:free', label: 'Gemini 2.5' },
+        { id: 'meta-llama/llama-3.3-70b-instruct:free', label: 'Llama 3.3 70B Free' },
       ],
       role: 'Genera changelog y documentación del código refactorizado',
       chainSystemPrompt: `Eres el Documentador final de este pipeline. Recibirás el código original, la auditoría y el código refactorizado.
@@ -1844,7 +2075,7 @@ Formato limpio, técnico, sin relleno.`,
       title: '🤖 Diseñador de Contrato API',
       models: [
         { id: 'openai/gpt-4o',               label: 'GPT-4o' },
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Define el contrato de la integración: endpoints, payloads, errores',
       chainSystemPrompt: `Eres el Diseñador de contrato de este pipeline de integración API.
@@ -1856,7 +2087,7 @@ Sin código aún. Solo el diseño del contrato.`,
     q3: {
       title: '💡 Implementador de Integración',
       models: [
-        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen3-coder:free', label: 'Qwen3 Coder Free' },
       ],
       role: 'Implementa el código de integración completo basado en el contrato de Q2',
       chainSystemPrompt: `Eres el Implementador de este pipeline. Recibirás el contrato de integración API del cuadrante anterior.
@@ -1867,7 +2098,7 @@ tipado fuerte si el lenguaje lo permite. Código production-ready.`,
     q4: {
       title: '🚀 Auditor de Seguridad',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Revisa la implementación de Q3 en busca de vulnerabilidades',
       chainSystemPrompt: `Eres el Auditor de seguridad de este pipeline. Recibirás la implementación de integración API del cuadrante anterior.
@@ -1886,7 +2117,7 @@ Produce: lista de vulnerabilidades encontradas + versión corregida de los fragm
     q2: {
       title: '🤖 UX Architect',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Define estructura semántica, componentes y jerarquía visual',
       chainSystemPrompt: `Eres el UX Architect de este pipeline frontend.
@@ -1899,7 +2130,7 @@ Produce: (1) estructura HTML semántica por secciones con roles ARIA,
     q3: {
       title: '💡 Builder Frontend',
       models: [
-        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen3-coder:free', label: 'Qwen3 Coder Free' },
       ],
       role: 'Implementa HTML+CSS+JS completo siguiendo el blueprint de Q2',
       chainSystemPrompt: `Eres el Builder de este pipeline frontend. Recibirás el blueprint de arquitectura UI del cuadrante anterior.
@@ -1910,7 +2141,7 @@ semántica HTML5 correcta. Entrega el archivo completo listo para abrir en brows
     q4: {
       title: '🚀 Polish y Performance',
       models: [
-        { id: 'google/gemini-2.5-flash:free', label: 'Gemini 2.5' },
+        { id: 'meta-llama/llama-3.3-70b-instruct:free', label: 'Llama 3.3 70B Free' },
       ],
       role: 'Optimiza performance y añade micro-interacciones al código de Q3',
       chainSystemPrompt: `Eres el especialista de Polish de este pipeline. Recibirás el frontend implementado por el cuadrante anterior.
@@ -1942,7 +2173,7 @@ Tu análisis será usado por el Query Builder para escribir el SQL óptimo.`,
     q3: {
       title: '💡 Query Builder',
       models: [
-        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen3-coder:free', label: 'Qwen3 Coder Free' },
       ],
       role: 'Escribe el SQL optimizado siguiendo la estrategia de Q2',
       chainSystemPrompt: `Eres el Query Builder de este pipeline. Recibirás el análisis del esquema y la estrategia del cuadrante anterior.
@@ -1953,7 +2184,7 @@ versión EXPLAIN-ready. Dialect: especificado en el prompt original.`,
     q4: {
       title: '🚀 Auditor SQL',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Detecta problemas de performance y seguridad en la query de Q3',
       chainSystemPrompt: `Eres el Auditor SQL de este pipeline. Recibirás la query producida por el cuadrante anterior.
@@ -1972,7 +2203,7 @@ Produce: hallazgos con severidad + versión optimizada de la query si hay proble
     q2: {
       title: '🤖 Analizador de Casos',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Descompone el problema regex en casos y edge cases',
       chainSystemPrompt: `Eres el Analizador de patrones de este pipeline regex.
@@ -1986,7 +2217,7 @@ Tu análisis será la base para construir la expresión correcta.`,
     q3: {
       title: '💡 Constructor de Regex',
       models: [
-        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen3-coder:free', label: 'Qwen3 Coder Free' },
       ],
       role: 'Construye la expresión regular basado en el análisis de Q2',
       chainSystemPrompt: `Eres el Constructor de regex de este pipeline. Recibirás el análisis de casos del cuadrante anterior.
@@ -1997,7 +2228,7 @@ Entrega: (1) la regex con grupos nombrados donde aplique, (2) versión comentada
     q4: {
       title: '🚀 Suite de Tests',
       models: [
-        { id: 'google/gemini-2.5-flash:free', label: 'Gemini 2.5' },
+        { id: 'meta-llama/llama-3.3-70b-instruct:free', label: 'Llama 3.3 70B Free' },
       ],
       role: 'Genera la batería de tests para la regex de Q3',
       chainSystemPrompt: `Eres el QA de este pipeline regex. Recibirás el análisis de casos y la regex construida.
@@ -2016,7 +2247,7 @@ especificado en el prompt original. Sin relleno, solo el código de tests.`,
     q2: {
       title: '🤖 Estratega de Extracción',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Diseña la estrategia de scraping antes de escribir código',
       chainSystemPrompt: `Eres el Estratega de extracción de este pipeline de web scraping.
@@ -2029,7 +2260,7 @@ Tu estrategia será la guía del implementador.`,
     q3: {
       title: '💡 Implementador de Scraper',
       models: [
-        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen3-coder:free', label: 'Qwen3 Coder Free' },
       ],
       role: 'Implementa el scraper completo siguiendo la estrategia de Q2',
       chainSystemPrompt: `Eres el Implementador de este pipeline de scraping. Recibirás la estrategia de extracción del cuadrante anterior.
@@ -2070,7 +2301,7 @@ Produce: (1) servicios necesarios y sus responsabilidades, (2) networking: puert
     q3: {
       title: '💡 Builder de Configuraciones',
       models: [
-        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen3-coder:free', label: 'Qwen3 Coder Free' },
       ],
       role: 'Escribe todos los archivos de configuración basado en el blueprint de Q2',
       chainSystemPrompt: `Eres el Builder de configuraciones de este pipeline. Recibirás el blueprint de infraestructura del cuadrante anterior.
@@ -2081,7 +2312,7 @@ Cada archivo completo y listo para usar.`,
     q4: {
       title: '🚀 Security Hardening',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Aplica security hardening a las configuraciones de Q3',
       chainSystemPrompt: `Eres el especialista de Security Hardening de este pipeline. Recibirás todas las configuraciones de infraestructura.
@@ -2100,7 +2331,7 @@ Entrega las configuraciones con los cambios de seguridad aplicados y un resumen 
     q2: {
       title: '🤖 Extractor de Conocimiento',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Extrae toda la lógica implícita y decisiones de diseño del código',
       chainSystemPrompt: `Eres el Extractor de conocimiento de este pipeline de documentación.
@@ -2161,7 +2392,7 @@ Tu modelo será la base para generar el DDL completo.`,
     q3: {
       title: '💡 DDL Builder',
       models: [
-        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen3-coder:free', label: 'Qwen3 Coder Free' },
       ],
       role: 'Genera el DDL SQL completo basado en el modelo de Q2',
       chainSystemPrompt: `Eres el DDL Builder de este pipeline. Recibirás el modelo de datos del cuadrante anterior.
@@ -2173,7 +2404,7 @@ Dialecto: el especificado en el prompt original o PostgreSQL por defecto.`,
     q4: {
       title: '🚀 Validador de Modelo',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Valida el modelo y detecta anomalías de diseño',
       chainSystemPrompt: `Eres el Validador de modelo de este pipeline. Recibirás el diseño conceptual y el DDL generado.
@@ -2192,7 +2423,7 @@ Produce: lista de issues con severidad + DDL corregido si hay problemas crítico
     q2: {
       title: '🤖 Analista de Contexto DAX',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
         { id: 'openai/gpt-4o',               label: 'GPT-4o' },
       ],
       role: 'Descompone el requerimiento en términos DAX: contexto, funciones base',
@@ -2207,7 +2438,7 @@ Tu análisis guiará la construcción de la fórmula correcta.`,
     q3: {
       title: '💡 DAX Builder',
       models: [
-        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen3-coder:free', label: 'Qwen3 Coder Free' },
       ],
       role: 'Escribe la fórmula DAX completa basada en el análisis de Q2',
       chainSystemPrompt: `Eres el DAX Builder de este pipeline. Recibirás el análisis de contexto del cuadrante anterior.
@@ -2219,7 +2450,7 @@ Entrega: (1) la fórmula DAX lista para pegar en Power BI,
     q4: {
       title: '🚀 Documentador DAX',
       models: [
-        { id: 'google/gemini-2.5-flash:free', label: 'Gemini 2.5 Flash' },
+        { id: 'meta-llama/llama-3.3-70b-instruct:free', label: 'Llama 3.3 70B Free' },
       ],
       role: 'Documenta la fórmula y genera versión optimizada si aplica',
       chainSystemPrompt: `Eres el Documentador DAX de este pipeline. Recibirás el análisis y la fórmula construida.
@@ -2238,7 +2469,7 @@ Produce: (1) explicación en español del funcionamiento línea por línea,
     q2: {
       title: '🤖 Diseñador de Transformación',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Mapea estado inicial al estado final, define pasos necesarios',
       chainSystemPrompt: `Eres el Diseñador de transformación de este pipeline Power Query.
@@ -2251,7 +2482,7 @@ Esta hoja de ruta guiará la implementación en M.`,
     q3: {
       title: '💡 M Builder',
       models: [
-        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen3-coder:free', label: 'Qwen3 Coder Free' },
       ],
       role: 'Escribe la query M completa siguiendo el diseño de Q2',
       chainSystemPrompt: `Eres el M Builder de este pipeline. Recibirás el diseño de transformación del cuadrante anterior.
@@ -2295,7 +2526,7 @@ Tu plan será la guía del implementador del pipeline Pandas.`,
     q3: {
       title: '💡 Pipeline Builder Pandas',
       models: [
-        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen3-coder:free', label: 'Qwen3 Coder Free' },
       ],
       role: 'Implementa el pipeline de limpieza basado en el plan de Q2',
       chainSystemPrompt: `Eres el Pipeline Builder de este pipeline. Recibirás el plan de limpieza de datos del cuadrante anterior.
@@ -2307,7 +2538,7 @@ Código production-ready, comentado en pasos clave.`,
     q4: {
       title: '🚀 Validador de Calidad',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Añade assertions de calidad post-limpieza al pipeline de Q3',
       chainSystemPrompt: `Eres el Validador de calidad de este pipeline. Recibirás el plan de limpieza y el pipeline implementado.
@@ -2327,7 +2558,7 @@ Entrega el pipeline completo con la capa de validación integrada.`,
     q2: {
       title: '🤖 Matemático Estadístico',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Define el modelo formal: distribuciones, parámetros, supuestos',
       chainSystemPrompt: `Eres el Matemático de este pipeline estocástico.
@@ -2340,7 +2571,7 @@ Tu especificación matemática será implementada por un modelo especializado en
     q3: {
       title: '💡 Implementador Numérico',
       models: [
-        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen3-coder:free', label: 'Qwen3 Coder Free' },
       ],
       role: 'Implementa la simulación basado en el modelo matemático de Q2',
       chainSystemPrompt: `Eres el Implementador numérico de este pipeline. Recibirás la especificación matemática del cuadrante anterior.
@@ -2385,7 +2616,7 @@ Tu informe será validado contra lógica contable por el siguiente modelo.`,
     q3: {
       title: '💡 Validador Contable',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Valida cada hallazgo de Q2 con lógica contable',
       chainSystemPrompt: `Eres el Validador contable de este pipeline. Recibirás el informe de hallazgos del auditor principal.
@@ -2397,7 +2628,7 @@ Produce el informe validado con tu evaluación de cada hallazgo.`,
     q4: {
       title: '🚀 Generador de Informe Ejecutivo',
       models: [
-        { id: 'google/gemini-2.5-flash:free', label: 'Gemini 2.5' },
+        { id: 'meta-llama/llama-3.3-70b-instruct:free', label: 'Llama 3.3 70B Free' },
       ],
       role: 'Produce el informe ejecutivo final con los hallazgos validados',
       chainSystemPrompt: `Eres el Generador de informe de este pipeline. Recibirás los hallazgos del auditor y la validación contable.
@@ -2416,7 +2647,7 @@ Formato profesional, sin jerga técnica innecesaria, orientado a la toma de deci
     q2: {
       title: '🤖 UX de Datos',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Define estructura del dashboard: KPIs, jerarquía visual, audiencia',
       chainSystemPrompt: `Eres el UX de datos de este pipeline de dashboard.
@@ -2476,7 +2707,7 @@ Produce: (1) estimación de recursos: RAM necesaria, tiempo estimado con y sin o
     q3: {
       title: '💡 Implementador de Pipeline',
       models: [
-        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen3-coder:free', label: 'Qwen3 Coder Free' },
       ],
       role: 'Implementa el pipeline de procesamiento basado en la arquitectura de Q2',
       chainSystemPrompt: `Eres el Implementador de este pipeline de datos masivos. Recibirás la arquitectura de procesamiento del cuadrante anterior.
@@ -2488,7 +2719,7 @@ Código production-ready optimizado para el volumen estimado.`,
     q4: {
       title: '🚀 Optimizador de Memoria',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Aplica optimizaciones de memoria y tipos al pipeline de Q3',
       chainSystemPrompt: `Eres el Optimizador de memoria de este pipeline. Recibirás la arquitectura y el pipeline implementado.
@@ -2509,7 +2740,7 @@ Entrega el pipeline completo con las optimizaciones aplicadas y estimación de r
       title: '🤖 Analista de Estructura PDF',
       models: [
         { id: 'openai/gpt-4o',               label: 'GPT-4o' },
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Analiza el layout del PDF y diseña la estrategia de extracción',
       chainSystemPrompt: `Eres el Analista de estructura de este pipeline de extracción PDF.
@@ -2523,7 +2754,7 @@ Tu estrategia guiará al implementador.`,
     q3: {
       title: '💡 Extractor PDF',
       models: [
-        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen3-coder:free', label: 'Qwen3 Coder Free' },
       ],
       role: 'Implementa el extractor basado en la estrategia de Q2',
       chainSystemPrompt: `Eres el Implementador de extracción PDF de este pipeline. Recibirás la estrategia de extracción del cuadrante anterior.
@@ -2535,7 +2766,7 @@ Código listo para ejecutar con la librería especificada en la estrategia.`,
     q4: {
       title: '🚀 Validador de Extracción',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Valida la integridad de los datos extraídos',
       chainSystemPrompt: `Eres el Validador de este pipeline de extracción PDF. Recibirás la estrategia y el extractor implementado.
@@ -2555,7 +2786,7 @@ Entrega el script completo con la validación integrada.`,
     q2: {
       title: '🤖 Estadístico Predictivo',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Define el modelo probabilístico para la simulación',
       chainSystemPrompt: `Eres el Estadístico de este pipeline predictivo Monte Carlo.
@@ -2569,7 +2800,7 @@ Produce: (1) distribuciones de entrada para cada variable con parámetros estima
     q3: {
       title: '💡 Simulador Monte Carlo',
       models: [
-        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen3-coder:free', label: 'Qwen3 Coder Free' },
       ],
       role: 'Implementa la simulación completa basada en el modelo de Q2',
       chainSystemPrompt: `Eres el Implementador de la simulación de este pipeline. Recibirás el modelo probabilístico del cuadrante anterior.
@@ -2605,7 +2836,7 @@ Produce: (1) interpretación de cada percentil clave en lenguaje de negocio,
     q2: {
       title: '🤖 Arquitecto de Automatización',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Define la lógica de automatización: triggers, flujos, integraciones',
       chainSystemPrompt: `Eres el Arquitecto de automatización de este pipeline Google Workspace.
@@ -2619,7 +2850,7 @@ Produce: (1) triggers necesarios (onOpen, onEdit, onChange, time-based) y su con
     q3: {
       title: '💡 Desarrollador Apps Script',
       models: [
-        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen3-coder:free', label: 'Qwen3 Coder Free' },
       ],
       role: 'Implementa el script completo siguiendo el diseño de Q2',
       chainSystemPrompt: `Eres el Desarrollador Apps Script de este pipeline. Recibirás el diseño de automatización del cuadrante anterior.
@@ -2631,7 +2862,7 @@ Código listo para pegar en el editor de Apps Script.`,
     q4: {
       title: '🚀 Fórmulas y Deployment',
       models: [
-        { id: 'google/gemini-2.5-flash:free', label: 'Gemini 2.5' },
+        { id: 'meta-llama/llama-3.3-70b-instruct:free', label: 'Llama 3.3 70B Free' },
       ],
       role: 'Genera fórmulas complementarias e instrucciones de deployment',
       chainSystemPrompt: `Eres el especialista de deployment de este pipeline. Recibirás el diseño y el script implementado.
@@ -2677,7 +2908,7 @@ Cada sección con la extensión necesaria y no más.`,
     q4: {
       title: '🚀 Editor Final',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Revisa coherencia argumental y produce versión final',
       chainSystemPrompt: `Eres el Editor final de este pipeline. Recibirás la estrategia y el borrador del informe.
@@ -2722,7 +2953,7 @@ Ordenadas de mayor a menor impacto potencial.`,
     q4: {
       title: '🚀 Reporte Ejecutivo de Costos',
       models: [
-        { id: 'google/gemini-2.5-flash:free', label: 'Gemini 2.5' },
+        { id: 'meta-llama/llama-3.3-70b-instruct:free', label: 'Llama 3.3 70B Free' },
       ],
       role: 'Genera tabla comparativa y recomendación priorizada',
       chainSystemPrompt: `Eres el Reportero de este pipeline. Recibirás el análisis de costos y las oportunidades de optimización identificadas.
@@ -2741,7 +2972,7 @@ próximos pasos con responsable y fecha sugerida.`,
     q2: {
       title: '🤖 Diseñador de Algoritmo de Matching',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Define la lógica de matching para la conciliación',
       chainSystemPrompt: `Eres el Diseñador del algoritmo de conciliación de este pipeline.
@@ -2755,7 +2986,7 @@ Tu diseño será implementado en Python/Pandas.`,
     q3: {
       title: '💡 Implementador del Conciliador',
       models: [
-        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen3-coder:free', label: 'Qwen3 Coder Free' },
       ],
       role: 'Implementa el algoritmo de conciliación basado en el diseño de Q2',
       chainSystemPrompt: `Eres el Implementador de este pipeline de conciliación. Recibirás el diseño del algoritmo de matching del cuadrante anterior.
@@ -2802,7 +3033,7 @@ Tu marco será usado para cruzar contra los registros específicos.`,
     q3: {
       title: '💡 Verificador de Registros',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Cruza los registros descritos contra el marco normativo de Q2',
       chainSystemPrompt: `Eres el Verificador de registros de este pipeline. Recibirás el marco normativo del cuadrante anterior.
@@ -2833,7 +3064,7 @@ Formato apto para presentar ante organismo regulador o directorio.`,
     q2: {
       title: '🤖 Calculador Actuarial',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Calcula primas, coberturas y ajustes por perfil de riesgo',
       chainSystemPrompt: `Eres el Calculador actuarial de este pipeline de seguros.
@@ -2848,7 +3079,7 @@ Tus cálculos serán la base de la cotización formal.`,
     q3: {
       title: '💡 Constructor de Cotización',
       models: [
-        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen3-coder:free', label: 'Qwen3 Coder Free' },
       ],
       role: 'Estructura la cotización completa basada en los cálculos de Q2',
       chainSystemPrompt: `Eres el Constructor de cotización de este pipeline. Recibirás los cálculos actuariales del cuadrante anterior.
@@ -2860,7 +3091,7 @@ firma y validez de la cotización. Formato estructurado listo para renderizar.`,
     q4: {
       title: '🚀 Cotización HTML',
       models: [
-        { id: 'google/gemini-2.5-flash:free', label: 'Gemini 2.5' },
+        { id: 'meta-llama/llama-3.3-70b-instruct:free', label: 'Llama 3.3 70B Free' },
       ],
       role: 'Genera el documento HTML profesional de la cotización',
       chainSystemPrompt: `Eres el Formateador de este pipeline. Recibirás la cotización estructurada del cuadrante anterior.
@@ -2905,7 +3136,7 @@ dependencias de tarea a tarea. Formato de tabla estructurada.`,
     q4: {
       title: '🚀 Cronograma y Camino Crítico',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Produce el cronograma con camino crítico identificado',
       chainSystemPrompt: `Eres el Generador de cronograma de este pipeline. Recibirás el plan estratégico y el WBS detallado.
@@ -2925,7 +3156,7 @@ Produce: (1) cronograma en texto estructurado tipo Gantt (semana por semana o me
     q2: {
       title: '🤖 Experto en Procesos ISO',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Mapea el proceso completo: entradas, salidas, puntos de control',
       chainSystemPrompt: `Eres el Experto en procesos de este pipeline de documentación ISO.
@@ -2953,7 +3184,7 @@ Estructura obligatoria: 1. Objetivo, 2. Alcance, 3. Definiciones y abreviaturas,
     q4: {
       title: '🚀 Validador de Cumplimiento',
       models: [
-        { id: 'google/gemini-2.5-flash:free', label: 'Gemini 2.5' },
+        { id: 'meta-llama/llama-3.3-70b-instruct:free', label: 'Llama 3.3 70B Free' },
       ],
       role: 'Verifica que el procedimiento cumple los requisitos de la norma',
       chainSystemPrompt: `Eres el Validador de cumplimiento de este pipeline. Recibirás el mapa de proceso y el procedimiento redactado.
@@ -3000,7 +3231,7 @@ Bases tu evaluación en la información disponible con evidencia o justificació
     q4: {
       title: '🚀 Recomendación Final',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Produce recomendación razonada y plan de contingencia',
       chainSystemPrompt: `Eres el Decisor final de este pipeline. Recibirás la matriz y las evaluaciones de todos los proveedores.
@@ -3046,7 +3277,7 @@ infraestructura de carga disponible en la zona de uso. Tabla comparativa final.`
     q4: {
       title: '🚀 Ficha de Decisión',
       models: [
-        { id: 'google/gemini-2.5-flash:free', label: 'Gemini 2.5' },
+        { id: 'meta-llama/llama-3.3-70b-instruct:free', label: 'Llama 3.3 70B Free' },
       ],
       role: 'Produce la ficha ejecutiva de decisión',
       chainSystemPrompt: `Eres el Generador de ficha de este pipeline. Recibirás el análisis de ROI y la comparativa técnica.
@@ -3065,7 +3296,7 @@ Formato ejecutivo, una página, orientado a la toma de decisión.`,
     q2: {
       title: '🤖 Estratega de Tiempo',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Analiza prioridades y diseña la estrategia de bloques',
       chainSystemPrompt: `Eres el Estratega de tiempo de este pipeline de planificación.
@@ -3092,7 +3323,7 @@ Usa técnica Pomodoro (25+5) o bloques de 90 min según la naturaleza de cada ta
     q4: {
       title: '🚀 Resumen Express del Día',
       models: [
-        { id: 'google/gemini-2.5-flash:free', label: 'Gemini 2.5 Flash' },
+        { id: 'meta-llama/llama-3.3-70b-instruct:free', label: 'Llama 3.3 70B Free' },
       ],
       role: 'Produce el resumen ultra-compacto de la agenda',
       chainSystemPrompt: `Eres el Resumen express de este pipeline. Recibirás la estrategia y la agenda detallada.
@@ -3114,7 +3345,7 @@ Solo las cosas que realmente se harán hoy. Sin explicaciones, sin contexto adic
     q2: {
       title: '🤖 Estratega de Contenido',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Define el hook, arco narrativo y estructura del video',
       chainSystemPrompt: `Eres el Estratega de contenido de este pipeline de guiones TikTok/Gaming.
@@ -3188,7 +3419,7 @@ Produce mínimo 10 ideas distribuidas entre los pilares de contenido definidos.`
     q4: {
       title: '🚀 Optimizador SEO y CTR',
       models: [
-        { id: 'google/gemini-2.5-flash:free', label: 'Gemini 2.5' },
+        { id: 'meta-llama/llama-3.3-70b-instruct:free', label: 'Llama 3.3 70B Free' },
       ],
       role: 'Genera variantes de título A/B/C y descripción SEO para el top 3',
       chainSystemPrompt: `Eres el Optimizador SEO y CTR de este pipeline. Recibirás la estrategia y las ideas de video.
@@ -3235,7 +3466,7 @@ incluir los meta tags producidos por la estrategia. Listo para publicar.`,
     q4: {
       title: '🚀 Adaptador Multi-Red',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Adapta el contenido de Q3 para cada red social',
       chainSystemPrompt: `Eres el Adaptador multi-red de este pipeline. Recibirás la estrategia y el contenido creado.
@@ -3256,7 +3487,7 @@ TikTok: guión de video de 30-45s con texto en pantalla clave.`,
     q2: {
       title: '🤖 Game Designer UEFN',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Diseña la mecánica de juego: reglas, dispositivos, flujo del jugador',
       chainSystemPrompt: `Eres el Game Designer de este pipeline UEFN.
@@ -3271,7 +3502,7 @@ Tu diseño guiará la implementación en Verse.`,
     q3: {
       title: '💡 Verse Developer',
       models: [
-        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen3-coder:free', label: 'Qwen3 Coder Free' },
       ],
       role: 'Implementa la lógica en Verse siguiendo el diseño de Q2',
       chainSystemPrompt: `Eres el Verse Developer de este pipeline. Recibirás el diseño de la mecánica del cuadrante anterior.
@@ -3283,7 +3514,7 @@ Código correcto para la versión actual de Verse en UEFN.`,
     q4: {
       title: '🚀 QA de Mecánicas',
       models: [
-        { id: 'google/gemini-2.5-flash:free', label: 'Gemini 2.5 Flash' },
+        { id: 'meta-llama/llama-3.3-70b-instruct:free', label: 'Llama 3.3 70B Free' },
       ],
       role: 'Genera checklist de QA y casos de prueba para las mecánicas',
       chainSystemPrompt: `Eres el QA de mecánicas de este pipeline UEFN. Recibirás el diseño y la implementación en Verse.
@@ -3302,7 +3533,7 @@ Produce: (1) lista de casos a probar (happy path + edge cases del diseño),
     q2: {
       title: '🤖 Analista de Meta FPS',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Descompone la situación táctica: mapa, posiciones, ventajas',
       chainSystemPrompt: `Eres el Analista táctico de este pipeline FPS.
@@ -3348,7 +3579,7 @@ Cada regla máximo 15 palabras. Son las 5 cosas que el jugador debe recordar cua
     q2: {
       title: '🤖 Traductor Principal',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Produce la traducción completa preservando terminología técnica',
       chainSystemPrompt: `Eres el Traductor principal de este pipeline de traducción técnica.
@@ -3373,7 +3604,7 @@ Entrega el texto revisado con los cambios marcados en [CAMBIO: razón].`,
     q4: {
       title: '🚀 Versión Final Publicable',
       models: [
-        { id: 'google/gemini-2.5-flash:free', label: 'Gemini 2.5' },
+        { id: 'meta-llama/llama-3.3-70b-instruct:free', label: 'Llama 3.3 70B Free' },
       ],
       role: 'Produce la versión final limpia lista para publicar',
       chainSystemPrompt: `Eres el Editor final de este pipeline de traducción. Recibirás la traducción revisada.
@@ -3406,7 +3637,7 @@ Tu extracción será la base para la síntesis y la crítica.`,
     q3: {
       title: '💡 Sintetizador Accesible',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Produce el resumen accesible para no especialistas',
       chainSystemPrompt: `Eres el Sintetizador de este pipeline. Recibirás los componentes estructurales del paper del cuadrante anterior.
@@ -3438,7 +3669,7 @@ Sin sesgo de confirmación. Si el paper tiene problemas, dilo.`,
     q2: {
       title: '🤖 Brand Strategist',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Define posicionamiento, arquetipo y territorio semántico de la marca',
       chainSystemPrompt: `Eres el Brand Strategist de este pipeline de branding.
@@ -3512,7 +3743,7 @@ Listo para enviar.`,
     q4: {
       title: '🚀 Revisor de Comunicación',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Verifica tono, detecta ambigüedades y produce versión final',
       chainSystemPrompt: `Eres el Revisor final de este pipeline. Recibirás la estrategia y el correo redactado.
@@ -3533,7 +3764,7 @@ Entrega la versión final corregida lista para enviar.`,
     q2: {
       title: '🤖 Arquitecto de Prompts',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Diseña la estructura del prompt: sistema, few-shots, formato',
       chainSystemPrompt: `Eres el Arquitecto de prompts de este pipeline de prompt engineering.
@@ -3581,7 +3812,7 @@ Produce: (1) evaluación de cada variante con su fortaleza y debilidad principal
     q2: {
       title: '🤖 Editor de Contenido',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Corrige ortografía, gramática y coherencia argumental',
       chainSystemPrompt: `Eres el Editor de contenido de este pipeline de corrección.
@@ -3606,7 +3837,7 @@ evita repetición de palabras en párrafos cercanos. Entrega el texto estilizado
     q4: {
       title: '🚀 Verificador de Tono Final',
       models: [
-        { id: 'google/gemini-2.5-flash:free', label: 'Gemini 2.5' },
+        { id: 'meta-llama/llama-3.3-70b-instruct:free', label: 'Llama 3.3 70B Free' },
       ],
       role: 'Verifica coherencia de tono y entrega versión final',
       chainSystemPrompt: `Eres el Verificador de tono final de este pipeline. Recibirás el texto original y las versiones corregidas.
@@ -3624,7 +3855,7 @@ pérdida de la voz del autor en la corrección de estilo. Produce la versión fi
     q2: {
       title: '🤖 Entrevistador Senior',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Formula preguntas técnicas progresivas y evalúa respuestas',
       chainSystemPrompt: `Eres el Entrevistador senior de este pipeline de preparación de entrevistas.
@@ -3670,7 +3901,7 @@ Produce: (1) recursos concretos por gap (documentación, cursos específicos, pr
     q2: {
       title: '🤖 Visual Strategist',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Define estilo, composición, paleta y mood de la imagen',
       chainSystemPrompt: `Eres el Visual Strategist de este pipeline de prompt engineering para imágenes IA.
@@ -3699,7 +3930,7 @@ Produce: (1) prompt positivo completo para Midjourney con pesos si aplica,
     q4: {
       title: '🚀 Preview SVG del Concepto',
       models: [
-        { id: 'google/gemini-2.5-flash:free', label: 'Gemini 2.5 Flash' },
+        { id: 'meta-llama/llama-3.3-70b-instruct:free', label: 'Llama 3.3 70B Free' },
       ],
       role: 'Genera infografía SVG de referencia de composición',
       chainSystemPrompt: `Genera exclusivamente el elemento SVG o infografía visual solicitada como referencia de composición.
@@ -3718,7 +3949,7 @@ El SVG debe representar la composición, paleta y elementos definidos en el cont
     q2: {
       title: '🤖 Diseñador de Pipeline de Video',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Define el flujo de procesamiento de video: inputs, transformaciones, outputs',
       chainSystemPrompt: `Eres el Diseñador de pipeline de video de este proyecto.
@@ -3763,7 +3994,7 @@ Produce: (1) versión optimizada de cada comando FFmpeg con flags de hardware ac
     q2: {
       title: '🤖 Director Creativo',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Define narrativa, arco emocional y estructura de escenas',
       chainSystemPrompt: `Eres el Director creativo de este pipeline de guiones y storyboarding.
@@ -3808,7 +4039,7 @@ duración del plano, audio/diálogo correspondiente.`,
     q2: {
       title: '🤖 Redactor de Mensajes',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Produce el mensaje completo con el tono correcto',
       chainSystemPrompt: `Eres el Redactor de este pipeline de comunicación cotidiana.
@@ -3832,7 +4063,7 @@ Entrega la versión mínima viable del mensaje que aún logra el objetivo.`,
     q4: {
       title: '🚀 Versión Express',
       models: [
-        { id: 'google/gemini-2.5-flash:free', label: 'Gemini 2.5 Flash' },
+        { id: 'meta-llama/llama-3.3-70b-instruct:free', label: 'Llama 3.3 70B Free' },
       ],
       role: 'Produce la versión ultra-corta para WhatsApp/SMS',
       chainSystemPrompt: `Eres el especialista de versión express de este pipeline. Recibirás el mensaje simplificado del cuadrante anterior.
@@ -3865,7 +4096,7 @@ Tu extracción guiará la síntesis semántica.`,
     q3: {
       title: '💡 Sintetizador Semántico',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Produce el párrafo ultra-denso con todas las ideas fuerza',
       chainSystemPrompt: `Eres el Sintetizador semántico de este pipeline. Recibirás el mapa de ideas del cuadrante anterior.
@@ -3877,7 +4108,7 @@ Denso, preciso, completo.`,
     q4: {
       title: '🚀 TL;DR Final',
       models: [
-        { id: 'google/gemini-2.5-flash:free', label: 'Gemini 2.5' },
+        { id: 'meta-llama/llama-3.3-70b-instruct:free', label: 'Llama 3.3 70B Free' },
       ],
       role: 'Produce el resumen de 1-3 líneas para compartir',
       chainSystemPrompt: `Eres el TL;DR de este pipeline. Recibirás el mapa de ideas y la síntesis del texto.
@@ -3915,7 +4146,7 @@ Tu análisis será auditado por un modelo especializado en validación lógica.`
     q3: {
       title: '💡 Auditor Lógico Claude',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Audita el razonamiento de Q2 y valida consistencia lógica',
       chainSystemPrompt: `Eres el Auditor lógico de este pipeline. Recibirás el análisis del cuadrante anterior.
@@ -3930,7 +4161,7 @@ Tu auditoría alimentará la síntesis ensemble final.`,
     q4: {
       title: '🚀 Sintetizador Ensemble Gemini',
       models: [
-        { id: 'google/gemini-2.5-flash:free', label: 'Gemini 2.5 Flash Free' },
+        { id: 'meta-llama/llama-3.3-70b-instruct:free', label: 'Llama 3.3 70B Free' },
       ],
       role: 'Produce la predicción final ensemble resolviendo discrepancias',
       chainSystemPrompt: `Eres el Sintetizador ensemble de este pipeline. Recibirás el análisis táctico y la auditoría lógica.
@@ -3950,7 +4181,7 @@ Produce: (1) resolución de cada discrepancia encontrada entre el análisis y la
     q2: {
       title: '🤖 Auditor Arquitectural Claude',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Auditoría de arquitectura y refactorización de alto nivel',
       chainSystemPrompt: `Eres el Auditor arquitectural de este pipeline de auditoría multi-capa.
@@ -3964,7 +4195,7 @@ Tu auditoría arquitectural guiará la validación a nivel de código.`,
     q3: {
       title: '💡 Validador de Código Qwen',
       models: [
-        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen3-coder:free', label: 'Qwen3 Coder Free' },
       ],
       role: 'Valida sintaxis, edge cases y produce el código refactorizado',
       chainSystemPrompt: `Eres el Validador de código de este pipeline. Recibirás la auditoría arquitectural del cuadrante anterior.
@@ -3977,7 +4208,7 @@ Código completo y ejecutable.`,
     q4: {
       title: '🚀 Documentador de Auditoría',
       models: [
-        { id: 'google/gemini-2.5-flash:free', label: 'Gemini 2.5 Flash Free' },
+        { id: 'meta-llama/llama-3.3-70b-instruct:free', label: 'Llama 3.3 70B Free' },
       ],
       role: 'Documenta los cambios realizados y genera el reporte de auditoría',
       chainSystemPrompt: `Eres el Documentador de este pipeline. Recibirás la auditoría arquitectural y el código refactorizado.
@@ -3997,7 +4228,7 @@ Produce: (1) resumen ejecutivo de la auditoría (para un manager técnico),
     q2: {
       title: '🤖 Redactor Narrativo Claude',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Produce el borrador con estructura narrativa sólida',
       chainSystemPrompt: `Eres el Redactor narrativo de este pipeline de contenido estratégico.
@@ -4054,7 +4285,7 @@ Estructura: [PREGUNTA] → [RESPUESTA] → [SECCIÓN DE ORIGEN].`,
     q3: {
       title: '💡 Verificador de Coherencia Claude',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Verifica que las respuestas de Q2 son coherentes con el documento',
       chainSystemPrompt: `Eres el Verificador de coherencia de este pipeline. Recibirás las respuestas del cuadrante anterior y el documento original.
@@ -4066,7 +4297,7 @@ Produce el reporte de verificación con: qué es correcto, qué es incorrecto, q
     q4: {
       title: '🚀 Resumen Ejecutivo Gemini',
       models: [
-        { id: 'google/gemini-2.5-flash:free', label: 'Gemini 2.5 Flash Free' },
+        { id: 'meta-llama/llama-3.3-70b-instruct:free', label: 'Llama 3.3 70B Free' },
       ],
       role: 'Genera resumen ejecutivo y lista de gaps del documento',
       chainSystemPrompt: `Eres el Sintetizador final de este pipeline. Recibirás las respuestas verificadas del documento.
@@ -4086,7 +4317,7 @@ Produce: (1) resumen ejecutivo del documento en máximo 200 palabras,
     q2: {
       title: '🤖 Arquitecto de Prompt Claude',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Diseña y redacta el master prompt con estructura técnica',
       chainSystemPrompt: `Eres el Arquitecto de prompt de este pipeline colaborativo de prompt engineering.
@@ -4130,7 +4361,7 @@ Produce: (1) evaluación de cada prompt en dimensiones: claridad, completitud, r
     q2: {
       title: '🤖 Arquitecto de Agente Claude',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Diseña la arquitectura del agente: herramientas, memoria, condiciones de parada',
       chainSystemPrompt: `Eres el Arquitecto de agentes de este pipeline.
@@ -4145,7 +4376,7 @@ Tu arquitectura guiará la implementación.`,
     q3: {
       title: '💡 Implementador de Flujo Qwen',
       models: [
-        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen3-coder:free', label: 'Qwen3 Coder Free' },
       ],
       role: 'Implementa el flujo del agente en pseudocódigo o LangGraph',
       chainSystemPrompt: `Eres el Implementador de flujo de este pipeline. Recibirás la arquitectura del agente del cuadrante anterior.
@@ -4191,7 +4422,7 @@ Produce: (1) desglose de costo por modelo y endpoint,
     q3: {
       title: '💡 Optimizador de Prompts Claude',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Optimiza los prompts para reducir tokens sin perder calidad',
       chainSystemPrompt: `Eres el Optimizador de prompts de este pipeline. Recibirás el análisis de uso del cuadrante anterior.
@@ -4204,7 +4435,7 @@ Produce: (1) técnicas de compresión de prompts aplicables al caso (few-shot re
     q4: {
       title: '🚀 Reporte Ejecutivo de Ahorro Gemini',
       models: [
-        { id: 'google/gemini-2.5-flash:free', label: 'Gemini 2.5 Flash Free' },
+        { id: 'meta-llama/llama-3.3-70b-instruct:free', label: 'Llama 3.3 70B Free' },
       ],
       role: 'Genera reporte ejecutivo con proyección de ahorro',
       chainSystemPrompt: `Eres el Generador de reporte ejecutivo de este pipeline. Recibirás el análisis de uso y las optimizaciones propuestas.
@@ -4223,7 +4454,7 @@ métricas de monitoreo continuo recomendadas para evitar que los costos escalen 
     q2: {
       title: '🤖 Diseñador de Dataset Claude',
       models: [
-        { id: 'anthropic/claude-3.5-sonnet', label: 'Claude 3.5 Sonnet' },
+        { id: 'anthropic/claude-sonnet-5', label: 'Claude Sonnet 5' },
       ],
       role: 'Diseña la estructura y criterios de calidad del dataset',
       chainSystemPrompt: `Eres el Diseñador de dataset de este pipeline de fine-tuning.
@@ -4456,8 +4687,9 @@ if (IS_DEV) {
 // MÓDULO SYNTHESIS — Panel post-ejecución con resumen estructurado
 // ============================================================
 const Synthesis = {
-  _collapsed: false,
-  _report:    '',
+  _collapsed:    false,
+  _report:       '',
+  _plainSummary: '',
 
   render(downstream, optimizedPrompt) {
     const panel = document.getElementById('synthesis-panel');
@@ -4477,29 +4709,54 @@ const Synthesis = {
 
     if (results.length === 0) return;
 
-    // Construir reporte completo para clipboard (texto plano, sin HTML)
+    // Construir reporte técnico completo (usado por "🩺 Reporte Técnico de Diagnóstico")
     this._report = this._buildReport(results, optimizedPrompt);
+    this._plainSummary = '';
 
-    // Renderizar viñetas en el panel (solo textContent, sin innerHTML para LLM output)
+    // ── Renderizar panel en lenguaje simple ────────────────────
     body.innerHTML = '';
 
     const label = document.createElement('p');
-    label.className = 'text-[10px] text-gray-600 uppercase tracking-widest pb-1';
-    label.textContent = 'Comparativa de respuestas por cuadrante:';
+    label.className = 'text-[10px] text-gray-500 uppercase tracking-widest pb-2';
+    label.textContent = '¿Qué hicieron las IAs?';
     body.appendChild(label);
 
+    // Placeholder mientras se genera el resumen simple
+    const loading = document.createElement('p');
+    loading.id = 'synthesis-loading';
+    loading.className = 'text-xs text-gray-500 animate-pulse italic';
+    loading.textContent = 'Generando resumen en lenguaje simple…';
+    body.appendChild(loading);
+
+    // Contenedor del resumen simple (se llena en segundo plano)
+    const plainDiv = document.createElement('p');
+    plainDiv.id = 'synthesis-plain-summary';
+    plainDiv.className = 'text-sm text-gray-200 leading-relaxed hidden';
+    body.appendChild(plainDiv);
+
+    // Separador
+    const sep = document.createElement('div');
+    sep.className = 'border-t border-gray-800 mt-3 pt-2';
+    body.appendChild(sep);
+
+    // Resumen por cuadrante (compacto, como referencia técnica)
+    const detailLabel = document.createElement('p');
+    detailLabel.className = 'text-[10px] text-gray-600 uppercase tracking-widest pb-1';
+    detailLabel.textContent = 'Respuestas por motor:';
+    body.appendChild(detailLabel);
+
     results.forEach(r => {
-      const snippet = r.text.length > 260 ? r.text.slice(0, 260) + '…' : r.text;
+      const snippet = r.text.length > 180 ? r.text.slice(0, 180) + '…' : r.text;
 
       const row = document.createElement('div');
-      row.className = 'border-l-2 border-gray-700 pl-3 py-0.5 space-y-0.5';
+      row.className = 'border-l-2 border-gray-700 pl-3 py-0.5 space-y-0.5 mt-1';
 
       const titleSpan = document.createElement('span');
-      titleSpan.className = 'block text-[11px] font-bold text-gray-200';
+      titleSpan.className = 'block text-[11px] font-bold text-gray-300';
       titleSpan.textContent = r.title;
 
       const textSpan = document.createElement('span');
-      textSpan.className = 'block text-gray-500 leading-snug';
+      textSpan.className = 'block text-gray-600 leading-snug text-[11px]';
       textSpan.textContent = snippet;
 
       row.appendChild(titleSpan);
@@ -4515,6 +4772,109 @@ const Synthesis = {
     if (tog) tog.textContent = '▲';
     const bodyEl = document.getElementById('synthesis-body');
     if (bodyEl) bodyEl.style.display = '';
+
+    // Lanzar generación del resumen simple en segundo plano
+    this._generatePlainSummary(results, optimizedPrompt); // sin await
+  },
+
+  // Genera un resumen en lenguaje llano para usuarios no técnicos.
+  // Intenta múltiples modelos con fallback (igual que _autoDetect).
+  // Si todos fallan, muestra un mensaje de error descriptivo en el panel.
+  // Se llama sin await desde render() — opera en segundo plano.
+  async _generatePlainSummary(results, originalPrompt) {
+    if (!AppState.apiKeys.length) {
+      this._updateSummaryEl('⚠ Sin llaves de API configuradas.');
+      return;
+    }
+
+    const key = AppState.apiKeys[QuadrantState[1].keyIndex % AppState.apiKeys.length];
+
+    // Lista de modelos a intentar en orden — verificados contra el catálogo vivo de OpenRouter
+    const models = [
+      'meta-llama/llama-3.3-70b-instruct:free',
+      'openai/gpt-oss-120b:free',
+      'meta-llama/llama-3.1-70b-instruct',
+      'deepseek/deepseek-chat',
+      'meta-llama/llama-3.2-3b-instruct:free',
+    ];
+
+    const inputText = results.map(r =>
+      `[${r.title}]:\n${r.text.slice(0, 500)}`
+    ).join('\n\n---\n\n');
+
+    const sysPrompt = `Eres un asistente que explica resultados de IA a personas sin conocimientos técnicos.
+Recibirás respuestas de varios modelos de IA ante una consulta del usuario.
+Tu tarea:
+1. Escribe UN párrafo corto (máximo 3 oraciones) explicando qué lograron las IAs en conjunto, en lenguaje cotidiano y directo.
+2. Si algún motor falló o dio un resultado diferente, mencionarlo en una frase simple.
+3. Termina con una frase breve que indique si el resultado parece útil o necesita revisión.
+Prohibido usar jerga técnica. Escribe como si se lo explicaras a alguien por mensaje de texto.`;
+
+    const userMsg = `Consulta del usuario: "${originalPrompt}"\n\nResultados:\n${inputText}`;
+
+    for (const model of models) {
+      try {
+        const resp = await fetch(OPENROUTER_URL, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${key}`,
+            'Content-Type':  'application/json',
+            'HTTP-Referer':  window.location.origin,
+            'X-Title':       'IA ORCHESTRATOR - JW Solutions',
+          },
+          body: JSON.stringify({
+            model,
+            stream: false,
+            messages: [
+              { role: 'system', content: sysPrompt },
+              { role: 'user',   content: userMsg },
+            ],
+            max_tokens: 220,
+          }),
+        });
+
+        // 404 = modelo no disponible → intentar el siguiente
+        if (resp.status === 404) continue;
+
+        // Otro error HTTP no recuperable → salir del loop
+        if (!resp.ok) {
+          this._updateSummaryEl(`⚠ No se pudo generar el resumen (error ${resp.status}).`);
+          return;
+        }
+
+        const data  = await resp.json();
+        const plain = data.choices?.[0]?.message?.content?.trim() ?? '';
+
+        if (!plain) continue; // respuesta vacía → intentar siguiente modelo
+
+        this._plainSummary = plain;
+        this._updateSummaryEl(plain);
+        return; // éxito → salir
+
+      } catch (err) {
+        // Error de red o abort → intentar siguiente modelo
+        if (err.name === 'AbortError') return;
+        continue;
+      }
+    }
+
+    // Todos los modelos fallaron
+    this._updateSummaryEl('⚠ No fue posible generar el resumen automático. Consulta el Reporte Técnico para ver el detalle.');
+  },
+
+  // Actualiza el elemento de resumen simple en el DOM.
+  // Usa textContent para evitar XSS. Si el elemento no existe,
+  // el texto quedará en _plainSummary para uso futuro.
+  _updateSummaryEl(text) {
+    const loadingEl = document.getElementById('synthesis-loading');
+    const summaryEl = document.getElementById('synthesis-plain-summary');
+
+    if (loadingEl) loadingEl.remove();
+
+    if (summaryEl) {
+      summaryEl.textContent = text;
+      summaryEl.classList.remove('hidden');
+    }
   },
 
   toggle() {
@@ -4528,8 +4888,9 @@ const Synthesis = {
   hide() {
     const panel = document.getElementById('synthesis-panel');
     if (panel) panel.style.display = 'none';
-    this._collapsed = false;
-    this._report    = '';
+    this._collapsed    = false;
+    this._report       = '';
+    this._plainSummary = '';
   },
 
   _buildReport(results, prompt) {
@@ -4839,12 +5200,80 @@ function newConversation() {
   FileAttachments.clear();
   Q4Preview.reset();
 
-  // 6. Ocultar panel de síntesis y limpiar bitácora técnica
+  // 6. Ocultar panel de síntesis, limpiar bitácora técnica y resumen de sesión
   Synthesis.hide();
   RunLog.clear();
+  SessionBanner.clear();
 
   UI.toast('🔄 Nueva conversación iniciada. Historial limpiado.');
 }
+
+// ============================================================
+// MÓDULO SESSION BANNER — Resumen de sesión anterior al cargar
+// ============================================================
+const SessionBanner = {
+  _key: SESSION_SUMMARY_KEY,
+
+  // Lee el resumen guardado en localStorage y muestra un banner
+  // informativo bajo el navbar. Si no hay datos, no muestra nada.
+  show() {
+    const raw = localStorage.getItem(this._key);
+    if (!raw) return;
+    let data;
+    try { data = JSON.parse(raw); } catch { return; }
+
+    // Necesita al menos un resumen de cuadrante para mostrar algo
+    const hasSummary = ['q1', 'q2', 'q3', 'q4'].some(k => data[k]);
+    if (!hasSummary) return;
+
+    const banner = document.createElement('div');
+    banner.id = 'session-banner';
+    banner.className = [
+      'w-full bg-blue-950/60 border-b border-blue-900/40',
+      'px-4 py-2 flex items-start justify-between gap-3',
+      'text-xs text-blue-200',
+    ].join(' ');
+
+    const content = document.createElement('div');
+    content.className = 'flex-1 min-w-0 space-y-1';
+
+    const header = document.createElement('p');
+    header.className = 'font-bold text-blue-300 text-[11px] uppercase tracking-wide';
+    header.textContent = `📋 Sesión anterior${data.lastRun ? ` · ${data.lastRun}` : ''}`;
+    content.appendChild(header);
+
+    // Mostrar resumen por cuadrante disponible
+    const qLabels = { q1: '⚡ Optimizador', q2: '🤖 Motor Avanzado', q3: '💡 Alternativa', q4: '🚀 Velocidad' };
+    ['q1', 'q2', 'q3', 'q4'].forEach(k => {
+      if (!data[k]) return;
+      const row = document.createElement('p');
+      row.className = 'text-blue-300/70 leading-relaxed';
+      const snippet = data[k].length > 180 ? data[k].slice(0, 180) + '…' : data[k];
+      row.textContent = `${qLabels[k]}: ${snippet}`;
+      content.appendChild(row);
+    });
+
+    const closeBtn = document.createElement('button');
+    closeBtn.className = 'shrink-0 text-blue-400 hover:text-white transition text-base leading-none mt-0.5';
+    closeBtn.textContent = '×';
+    closeBtn.title = 'Cerrar resumen de sesión';
+    closeBtn.addEventListener('click', () => banner.remove());
+
+    banner.appendChild(content);
+    banner.appendChild(closeBtn);
+
+    // Insertar debajo del navbar — buscar el primer <main> o body
+    const main = document.querySelector('main') ?? document.body;
+    main.insertAdjacentElement('beforebegin', banner);
+  },
+
+  // Borra el summary de localStorage y oculta el banner si está visible.
+  // Llamar desde newConversation().
+  clear() {
+    localStorage.removeItem(this._key);
+    document.getElementById('session-banner')?.remove();
+  },
+};
 
 // ============================================================
 // ARRANQUE
@@ -4865,19 +5294,36 @@ document.addEventListener('DOMContentLoaded', () => {
     ?.addEventListener('click', () => Theme.toggle());
   QuadrantColors.load();
 
-  // Panel de síntesis: colapsar / expandir + copiar reporte
+  // Panel de síntesis: colapsar / expandir
   document.getElementById('synthesis-header')
     ?.addEventListener('click', () => Synthesis.toggle());
+
+  // Menú de reportes: un botón agrupa "copiar respuestas" y "reporte técnico"
+  const reportsMenuBtn      = document.getElementById('btn-reports-menu');
+  const reportsMenuDropdown = document.getElementById('reports-menu-dropdown');
+  reportsMenuBtn?.addEventListener('click', e => {
+    e.stopPropagation(); // evitar que el click cierre/abra el panel de síntesis
+    reportsMenuDropdown?.classList.toggle('hidden');
+  });
+  // Cerrar el menú al hacer click fuera de él
+  document.addEventListener('click', e => {
+    if (reportsMenuDropdown && !reportsMenuDropdown.classList.contains('hidden') &&
+        !reportsMenuDropdown.contains(e.target) && e.target !== reportsMenuBtn) {
+      reportsMenuDropdown.classList.add('hidden');
+    }
+  });
   document.getElementById('btn-copy-report')
     ?.addEventListener('click', e => {
-      e.stopPropagation(); // evitar que el click cierre/abra el panel
+      e.stopPropagation();
+      reportsMenuDropdown?.classList.add('hidden');
       if (!Synthesis._report) return;
       navigator.clipboard.writeText(Synthesis._report).catch(() => {});
-      UI.toast('📋 Reporte copiado al portapapeles');
+      UI.toast('📋 Respuestas copiadas al portapapeles');
     });
   document.getElementById('btn-generate-report')
     ?.addEventListener('click', e => {
-      e.stopPropagation(); // evitar que el click cierre/abra el panel
+      e.stopPropagation();
+      reportsMenuDropdown?.classList.add('hidden');
       downloadTechnicalReport();
     });
 
@@ -4913,14 +5359,18 @@ document.addEventListener('DOMContentLoaded', () => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       if (Pipeline.active) { Pipeline.abort(); return; }
-      Orchestrator.run(textarea.value);
+      const prompt = textarea.value;
+      textarea.value = ''; // limpiar antes de ejecutar
+      Orchestrator.run(prompt);
     }
   });
 
   document.getElementById('btn-execute')
     ?.addEventListener('click', () => {
       if (Pipeline.active) { Pipeline.abort(); return; }
-      Orchestrator.run(textarea?.value ?? '');
+      const prompt = textarea?.value ?? '';
+      if (textarea) textarea.value = ''; // limpiar antes de ejecutar
+      Orchestrator.run(prompt);
     });
 
   // Bind de clic en LEDs para rotación manual por cuadrante
@@ -5012,4 +5462,7 @@ document.addEventListener('DOMContentLoaded', () => {
   // Debe llamarse DESPUÉS de que QuadrantState ya esté definido y al
   // final del arranque para no ser sobreescrito por otros init.
   Memory.init();
+
+  // Mostrar resumen de sesión anterior si existe
+  SessionBanner.show();
 });
