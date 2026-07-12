@@ -9,7 +9,7 @@ title IA ORCHESTRATOR DEBUG - Servidor Visible
 ::  Usar cuando iniciar.bat falla silenciosamente.
 :: ================================================================
 
-set "PROJECT_DIR=D:\PROYECTOS\Navegador IA"
+set "PROJECT_DIR=D:\PROYECTOS\P005-Navegador_multi_IA"
 set "PORT=8000"
 set "EDGE=C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
 set "TEMP_PS=%TEMP%\navia_debug_%PORT%.ps1"

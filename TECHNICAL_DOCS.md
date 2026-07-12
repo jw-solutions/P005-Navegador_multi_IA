@@ -107,20 +107,22 @@ El `.vbs` usa `WshShell.Run(..., 0)` para invocar `iniciar.bat` completamente oc
 | 706          | `QuadrantState`            | Estado por cuadrante: `keyIndex`, `controller`, `history[]`  |
 | 718          | `LED`                      | Semáforos visuales + click handler de rotación manual        |
 | 767          | `Output`                   | Render de burbujas (streaming), mensajes de error/warn       |
-| 859          | `fetchStreamForQuadrant`   | Fetch SSE, retry 429/402, fallback 404, `_DevSim` hook       |
-| 1051         | `Memory`                   | Ventana móvil: trigger=10, compacta 8, preserva 2            |
-| 1176         | `Pipeline`                 | Flag `active` + botón Cancelar                               |
-| 1209         | `Orchestrator`             | Fase 1 (Q1) → bifurca Fase 2 en `_runParallel` / `_runChain` según `pipelineMode` |
-| 1538         | `TASK_MATRIX`              | 58 entradas (`default` + `'1'`…`'56'`), 5 grupos             |
-| 4135         | `TaskRouter`               | Aplica TASK_MATRIX al DOM: títulos, selects, `.quad-star`, badge de modo |
-| 4230         | `QuadrantColors`           | Colores personalizados — inline style con `!important`       |
-| 4254         | `Theme`                    | Toggle claro/oscuro — `body.light-theme`                     |
-| 4320         | `Synthesis`                | Panel post-ejecución: comparativa + copy report              |
-| 4414         | `Q4Preview`                | Renderizador SVG/HTML en iframe sandboxed + pestañas         |
-| 4505         | `downloadQ4Render`         | Exportación SVG → PNG/JPG (canvas x2 High-DPI)              |
-| 4582         | `FileAttachments`          | Lectura FileReader UTF-8, badges, drag & drop, inject prompt |
-| 4669         | `newConversation()`        | Reset total: historiales, outputs, LEDs, adjuntos, preview   |
-| 4713         | `DOMContentLoaded`         | Init de todos los módulos y event bindings                   |
+| 859          | `fetchStreamForQuadrant`   | Fetch SSE, retry 429/402, fallback 404, `_DevSim` hook, alimenta `RunLog` |
+| 1060         | `Memory`                   | Ventana móvil: trigger=10, compacta 8, preserva 2            |
+| 1185         | `Pipeline`                 | Flag `active` + botón Cancelar                               |
+| 1205         | `RunLog`                   | Bitácora técnica de la ejecución en curso (errores, modelos, keys) |
+| 1293         | `downloadTechnicalReport()`| Descarga la bitácora de `RunLog` como archivo `.md`          |
+| 1337         | `Orchestrator`             | Fase 1 (Q1) → bifurca Fase 2 en `_runParallel` / `_runChain` según `pipelineMode` |
+| 1676         | `TASK_MATRIX`              | 58 entradas (`default` + `'1'`…`'56'`), 5 grupos             |
+| 4273         | `TaskRouter`               | Aplica TASK_MATRIX al DOM: títulos, selects, `.quad-star`, badge de modo |
+| 4368         | `QuadrantColors`           | Colores personalizados — inline style con `!important`       |
+| 4392         | `Theme`                    | Toggle claro/oscuro — `body.light-theme`                     |
+| 4458         | `Synthesis`                | Panel post-ejecución: comparativa + copy report               |
+| 4552         | `Q4Preview`                | Renderizador SVG/HTML en iframe sandboxed + pestañas         |
+| 4643         | `downloadQ4Render`         | Exportación SVG → PNG/JPG (canvas x2 High-DPI)              |
+| 4720         | `FileAttachments`          | Lectura FileReader UTF-8, badges, drag & drop, inject prompt |
+| 4807         | `newConversation()`        | Reset total: historiales, outputs, LEDs, adjuntos, preview, `RunLog` |
+| 4852         | `DOMContentLoaded`         | Init de todos los módulos y event bindings                   |
 
 ---
 
@@ -362,6 +364,41 @@ lo controla `q4.chainSystemPrompt` dentro de `Orchestrator._runChain()`, con el 
 
 ---
 
+## 8bis. RunLog — Reporte Técnico de Diagnóstico
+
+Botón `🩺 Generar Reporte Técnico` en el panel de Síntesis, junto a `📋 Copiar Reporte`.
+Distinto del reporte de Síntesis: **no incluye las respuestas de los modelos**, solo
+metadata de diagnóstico pensada para entregar al equipo técnico cuando algo falla.
+
+```
+RunLog.reset(prompt, taskKey, taskLabel, mode, downstream)   ← al iniciar Orchestrator.run()
+  → limpia entries[], guarda meta { rawPrompt, taskKey, taskLabel, pipelineMode, startedAt }
+
+fetchStreamForQuadrant() reporta a RunLog.log(qId, level, message) en cada evento:
+  · éxito (modelo + índice de llave usados)
+  · rotación de llave por 429/402
+  · fallback de modelo por 404
+  · error HTTP no recuperable
+  · error de red / stream interrumpido
+  · pool de llaves agotado
+
+_runChain() además registra la nota de degradación cuando un cuadrante
+falla y el siguiente continúa con el mejor contexto disponible.
+
+RunLog.finish()   ← al terminar run() (éxito, cancelación o fallo de Q1)
+RunLog.build()    ← arma el .md: header (tarea, modo, duración, prompt original)
+                    + una sección por cuadrante con estado final y eventos cronológicos
+downloadTechnicalReport()  ← dispara la descarga como reporte-tecnico_navia_<timestamp>.md
+```
+
+Las llaves nunca aparecen en texto plano en el reporte — los mensajes ya usan el
+índice 1-based (`Llave 2/3`), nunca el valor real, igual que en el resto de la app.
+
+`RunLog.clear()` se llama en `newConversation()` — el reporte técnico es por-sesión-de-run,
+no persiste entre conversaciones nuevas.
+
+---
+
 ## 9. Buscador Predictivo de Tareas
 
 ```html
@@ -506,7 +543,20 @@ Checklist:
 
 ## 14. Changelog
 
-### v1.4.0 — Julio 2026 *(sesión actual)*
+### v1.4.1 — Julio 2026 *(sesión actual)*
+- **[NEW]** Botón `🩺 Generar Reporte Técnico` en el panel de Síntesis
+  - Módulo `RunLog`: bitácora de eventos de diagnóstico por cuadrante durante cada ejecución
+    (rotaciones de key, fallbacks de modelo, errores HTTP/red, degradación de cadena, éxitos)
+  - `fetchStreamForQuadrant()` y `_runChain()` alimentan `RunLog.log()` en cada punto de fallo/éxito existente
+  - `downloadTechnicalReport()`: descarga el reporte como `.md`, sin incluir las respuestas
+    completas de los modelos (eso lo sigue cubriendo `📋 Copiar Reporte` de `Synthesis`)
+  - `RunLog.clear()` integrado en `newConversation()`
+- **[FIX]** `qwen/qwen-2.5-coder-72b:free` (ID de modelo inválido, causaba HTTP 400 en Q3 de
+  las 56 tareas nuevas) corregido a `qwen/qwen-2.5-coder-32b-instruct:free`
+- **[FIX]** `iniciar.bat` / `debug.bat`: `PROJECT_DIR` corregido de `D:\PROYECTOS\Navegador IA`
+  (no existía) a `D:\PROYECTOS\P005-Navegador_multi_IA`
+
+### v1.4.0 — Julio 2026
 - **[NEW]** Rediseño arquitectural: Pipeline en Cadena Multi-Rol Especializado
   - `pipelineMode` (`'chain'` | `'parallel'`) por tarea en `TASK_MATRIX`; `default` sigue en `'parallel'`
   - `Orchestrator._runChain()`: ejecuta Q2 → Q3 → Q4 secuencialmente, cada uno recibe

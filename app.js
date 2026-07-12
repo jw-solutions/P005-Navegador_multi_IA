@@ -860,6 +860,7 @@ async function fetchStreamForQuadrant(qId, messages) {
   const total = AppState.apiKeys.length;
   if (total === 0) {
     Output.renderMsg(qId, '❌ Sin llaves de API. Configura al menos 3 en ⚙️ Ajustes.', 'error');
+    RunLog.log(qId, 'error', '❌ Sin llaves de API configuradas.');
     LED.set(qId, 'error');
     return null;
   }
@@ -909,6 +910,7 @@ async function fetchStreamForQuadrant(qId, messages) {
         if (err.name === 'AbortError') return null; // cancelado intencionalmente por Pipeline.abort()
         LED.set(qId, 'error');
         Output.renderMsg(qId, `❌ Error de red: ${err.message}`, 'error');
+        RunLog.log(qId, 'error', `❌ Error de red: ${err.message}`);
         return null;
       }
     }
@@ -922,6 +924,7 @@ async function fetchStreamForQuadrant(qId, messages) {
         'color:#ef4444; font-weight:bold'
       );
       Output.renderMsg(qId, `⚠ Llave ${keyIdx + 1}: ${reason}. Rotando automáticamente…`, 'warn');
+      RunLog.log(qId, 'warn', `⚠ Llave ${keyIdx + 1}: ${reason}. Rotando a llave ${nextKeyIdx + 1}. Modelo: ${model}`);
       LED.set(qId, 'error');
 
       QuadrantState[qId].keyIndex = (keyIdx + 1) % total;
@@ -940,12 +943,14 @@ async function fetchStreamForQuadrant(qId, messages) {
       if (_fbs[nextIdx] !== undefined) {
         _modelFbIdx = nextIdx;
         Output.renderMsg(qId, `⚠ Modelo no disponible (404). Probando alternativo: ${_fbs[nextIdx]}…`, 'warn');
+        RunLog.log(qId, 'warn', `⚠ Modelo ${model} no disponible (404). Probando alternativo: ${_fbs[nextIdx]}`);
         await delay(400);
         LED.set(qId, 'loading');
         continue; // no decrementa attemptsLeft — el problema es el modelo, no la llave
       }
       LED.set(qId, 'error');
       Output.renderMsg(qId, `❌ Modelo no encontrado (404) y sin más alternativas para Q${qId}.`, 'error');
+      RunLog.log(qId, 'error', `❌ Modelo no encontrado (404) y sin más alternativas. Último intento: ${model}`);
       return null;
     }
 
@@ -953,6 +958,7 @@ async function fetchStreamForQuadrant(qId, messages) {
     if (!response.ok) {
       LED.set(qId, 'error');
       Output.renderMsg(qId, `❌ HTTP ${response.status}: ${response.statusText}`, 'error');
+      RunLog.log(qId, 'error', `❌ HTTP ${response.status}: ${response.statusText} — modelo: ${model}, llave ${keyIdx + 1}/${total}`);
       return null;
     }
 
@@ -1001,6 +1007,7 @@ async function fetchStreamForQuadrant(qId, messages) {
     } catch (err) {
       if (err.name !== 'AbortError') {
         Output.renderMsg(qId, `⚠ Stream interrumpido: ${err.message}`, 'warn');
+        RunLog.log(qId, 'error', `⚠ Stream interrumpido: ${err.message} — modelo: ${model}`);
       }
       return null;
     } finally {
@@ -1011,6 +1018,7 @@ async function fetchStreamForQuadrant(qId, messages) {
     }
 
     LED.set(qId, 'done');
+    RunLog.log(qId, 'info', `✅ Éxito — modelo: ${model}, llave ${keyIdx + 1}/${total}`);
     return fullText; // ✅ Éxito — devuelve el texto completo al orquestador
   }
 
@@ -1021,6 +1029,7 @@ async function fetchStreamForQuadrant(qId, messages) {
     `❌ Pool agotado: las ${total} llaves fallaron con 429/402. Añade llaves nuevas en ⚙️ Ajustes.`,
     'error'
   );
+  RunLog.log(qId, 'error', `❌ Pool agotado: las ${total} llaves fallaron con 429/402.`);
   return null;
 }
 
@@ -1184,6 +1193,125 @@ const Pipeline = {
   },
 };
 
+// ============================================================
+// RUNLOG — Bitácora técnica de la ejecución en curso
+//
+// Recopila, sin exponer keys en texto plano (solo índice 1-based),
+// los eventos de diagnóstico de cada cuadrante durante un run del
+// pipeline: rotaciones de key, fallbacks de modelo, errores HTTP/red,
+// interrupciones de stream y éxitos. Alimenta el botón
+// "🩺 Generar Reporte Técnico" del panel de Síntesis.
+// ============================================================
+const RunLog = {
+  entries: [],
+  meta: null,
+
+  reset(rawPrompt, taskKey, taskLabel, pipelineMode, downstream) {
+    this.entries = [];
+    this.meta = {
+      rawPrompt,
+      taskKey,
+      taskLabel,
+      pipelineMode,
+      downstream: [...downstream],
+      startedAt: new Date(),
+      finishedAt: null,
+    };
+  },
+
+  log(qId, level, message) {
+    if (!this.meta) return; // sin run activo (p.ej. mini-fetch de compactación)
+    this.entries.push({ qId, level, message, ts: new Date() });
+  },
+
+  finish() {
+    if (this.meta) this.meta.finishedAt = new Date();
+  },
+
+  clear() {
+    this.entries = [];
+    this.meta = null;
+  },
+
+  // Construye el reporte técnico en texto plano (Markdown-friendly).
+  // Deliberadamente NO incluye las respuestas completas de los modelos —
+  // eso ya lo cubre "📋 Copiar Reporte" (Synthesis). Este es solo diagnóstico.
+  build() {
+    if (!this.meta) return '';
+    const { rawPrompt, taskKey, taskLabel, pipelineMode, downstream, startedAt, finishedAt } = this.meta;
+    const line = '─'.repeat(52);
+    const durationSec = finishedAt ? ((finishedAt - startedAt) / 1000).toFixed(1) : '—';
+    const fmtTime = d => d ? d.toLocaleString('es-MX') : '—';
+
+    const header = [
+      '=== REPORTE TÉCNICO DE DIAGNÓSTICO — IA ORCHESTRATOR - JW Solutions ===',
+      `Fecha de inicio: ${fmtTime(startedAt)}`,
+      `Duración total: ${durationSec}s`,
+      `Tarea activa: ${taskLabel} (key: ${taskKey})`,
+      `Modo de pipeline: ${pipelineMode === 'chain' ? '🔗 Cadena' : '⚡ Paralelo'}`,
+      `Cuadrantes activos: ${downstream.map(id => `Q${id}`).join(', ') || 'ninguno'}`,
+      line,
+      'Prompt original del usuario:',
+      `"${rawPrompt}"`,
+      line,
+    ].join('\n');
+
+    const allQuadrants = [1, ...downstream];
+    const sections = allQuadrants.map(qId => {
+      const qEntries = this.entries.filter(e => e.qId === qId);
+      const titleEl  = document.getElementById(`title-${qId}`);
+      const title    = titleEl?.textContent?.trim() ?? `Cuadrante ${qId}`;
+
+      let estado;
+      if (qEntries.length === 0) {
+        estado = '⏳ No ejecutado';
+      } else if (qEntries.some(e => e.message.startsWith('✅'))) {
+        estado = '✅ Éxito';
+      } else if (qEntries.some(e => e.level === 'error')) {
+        estado = '❌ Falló';
+      } else {
+        estado = '⚠ Con advertencias';
+      }
+
+      const eventLines = qEntries.length
+        ? qEntries.map(e => `  [${e.ts.toLocaleTimeString('es-MX')}] ${e.message}`).join('\n')
+        : '  (sin eventos registrados)';
+
+      return `CUADRANTE ${qId} — ${title}\nEstado final: ${estado}\n${eventLines}`;
+    }).join('\n\n');
+
+    const hasErrors = this.entries.some(e => e.level === 'error');
+    const footer = hasErrors
+      ? '⚠ Esta ejecución presentó al menos un error — revisar detalle arriba.'
+      : '✅ Sin errores registrados en esta ejecución.';
+
+    return `${header}\n${sections}\n${line}\n${footer}\nGenerado por IA ORCHESTRATOR - JW Solutions`;
+  },
+};
+
+// Dispara la descarga del reporte técnico como archivo .md
+function downloadTechnicalReport() {
+  if (!RunLog.meta) {
+    UI.toast('⚠ Aún no hay ninguna ejecución para generar el reporte.');
+    return;
+  }
+  const content = RunLog.build();
+  const blob    = new Blob([content], { type: 'text/markdown;charset=utf-8' });
+  const url     = URL.createObjectURL(blob);
+  const stamp   = RunLog.meta.startedAt.toISOString().replace(/[:.]/g, '-');
+
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `reporte-tecnico_navia_${stamp}.md`;
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+
+  UI.toast('🩺 Reporte técnico descargado');
+}
+
 // Alterna la apariencia del botón de ejecución entre modo "ejecutar" y "cancelar"
 function setPipelineBtn(running) {
   const btn = document.getElementById('btn-execute');
@@ -1240,6 +1368,12 @@ const Orchestrator = {
       document.getElementById(`active-${qId}`)?.checked ?? false
     );
 
+    // Nueva bitácora técnica para esta ejecución (alimenta el reporte de diagnóstico)
+    const _taskKey   = AppState.currentTask ?? 'default';
+    const _taskLabel = taskSelectEl?.selectedOptions?.[0]?.textContent?.trim() ?? _taskKey;
+    const _mode      = (TASK_MATRIX[_taskKey] ?? TASK_MATRIX['default']).pipelineMode ?? 'parallel';
+    RunLog.reset(prompt, _taskKey, _taskLabel, _mode, downstream);
+
     [1, 2, 3, 4].forEach(qId => Output.clear(qId));
     Q4Preview.reset(); // limpiar preview de la ejecución anterior
 
@@ -1277,6 +1411,7 @@ const Orchestrator = {
         Output.clear(qId);
         LED.set(qId, document.getElementById(`active-${qId}`)?.checked ? 'done' : 'off');
       });
+      RunLog.finish();
       setPipelineBtn(false);
       return;
     }
@@ -1290,6 +1425,7 @@ const Orchestrator = {
         Output.renderMsg(qId, '⚠ El Optimizador (Q1) falló. Verifica las llaves y reintenta.', 'warn');
         LED.set(qId, 'off');
       });
+      RunLog.finish();
       Pipeline.active = false;
       setPipelineBtn(false);
       return;
@@ -1313,6 +1449,7 @@ const Orchestrator = {
 
     Pipeline.active = false;
     setPipelineBtn(false);
+    RunLog.finish();
 
     // Mostrar panel de síntesis con comparativa de cuadrantes activos
     Synthesis.render(downstream, finalPrompt);
@@ -1411,6 +1548,7 @@ const Orchestrator = {
           `⚠ Cuadrante ${qId} falló en la cadena. El siguiente paso recibirá el mejor contexto disponible.`,
           'warn'
         );
+        RunLog.log(qId, 'warn', `⚠ Degradación de cadena: el siguiente cuadrante continuará con el mejor contexto disponible.`);
         accumulatedContext = accumulatedContext +
           `\n\n---\n[NOTA: El Cuadrante ${qId} falló. Ajusta tu respuesta con el contexto disponible.]`;
       }
@@ -1553,7 +1691,7 @@ const TASK_MATRIX = {
       title: '💡 Alternativa Gratis',
       models: [
         { id: 'deepseek/deepseek-chat',        label: 'DeepSeek Chat' },
-        { id: 'qwen/qwen-2.5-coder-72b:free',  label: 'Qwen 2.5 Coder Free' },
+        { id: 'qwen/qwen-2.5-coder-32b-instruct:free',  label: 'Qwen 2.5 Coder Free' },
       ],
       role: 'Perspectiva alternativa',
     },
@@ -1591,7 +1729,7 @@ Sin saludos. Directo al diseño técnico.`,
     q3: {
       title: '💡 Implementador Qwen',
       models: [
-        { id: 'qwen/qwen-2.5-coder-72b:free', label: 'Qwen 2.5 Coder (Top)' },
+        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder (Top)' },
         { id: 'deepseek/deepseek-chat',        label: 'DeepSeek Chat' },
       ],
       role: 'Implementa el diseño de Q2 en código Python completo',
@@ -1634,7 +1772,7 @@ Tu output será usado por un modelo especializado en código para escribir el fi
     q3: {
       title: '💡 Cirujano de Código',
       models: [
-        { id: 'qwen/qwen-2.5-coder-72b:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
       ],
       role: 'Produce el fix exacto basado en el diagnóstico de Q2',
       chainSystemPrompt: `Eres el Cirujano de este pipeline. Recibirás el diagnóstico del cuadrante anterior.
@@ -1675,7 +1813,7 @@ Sé específico con líneas o funciones. Tu informe será la guía del refactori
     q3: {
       title: '💡 Refactorizador',
       models: [
-        { id: 'qwen/qwen-2.5-coder-72b:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
       ],
       role: 'Produce el código refactorizado completo basado en la auditoría de Q2',
       chainSystemPrompt: `Eres el Refactorizador de este pipeline. Recibirás la auditoría de deuda técnica del cuadrante anterior.
@@ -1718,7 +1856,7 @@ Sin código aún. Solo el diseño del contrato.`,
     q3: {
       title: '💡 Implementador de Integración',
       models: [
-        { id: 'qwen/qwen-2.5-coder-72b:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
       ],
       role: 'Implementa el código de integración completo basado en el contrato de Q2',
       chainSystemPrompt: `Eres el Implementador de este pipeline. Recibirás el contrato de integración API del cuadrante anterior.
@@ -1761,7 +1899,7 @@ Produce: (1) estructura HTML semántica por secciones con roles ARIA,
     q3: {
       title: '💡 Builder Frontend',
       models: [
-        { id: 'qwen/qwen-2.5-coder-72b:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
       ],
       role: 'Implementa HTML+CSS+JS completo siguiendo el blueprint de Q2',
       chainSystemPrompt: `Eres el Builder de este pipeline frontend. Recibirás el blueprint de arquitectura UI del cuadrante anterior.
@@ -1804,7 +1942,7 @@ Tu análisis será usado por el Query Builder para escribir el SQL óptimo.`,
     q3: {
       title: '💡 Query Builder',
       models: [
-        { id: 'qwen/qwen-2.5-coder-72b:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
       ],
       role: 'Escribe el SQL optimizado siguiendo la estrategia de Q2',
       chainSystemPrompt: `Eres el Query Builder de este pipeline. Recibirás el análisis del esquema y la estrategia del cuadrante anterior.
@@ -1848,7 +1986,7 @@ Tu análisis será la base para construir la expresión correcta.`,
     q3: {
       title: '💡 Constructor de Regex',
       models: [
-        { id: 'qwen/qwen-2.5-coder-72b:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
       ],
       role: 'Construye la expresión regular basado en el análisis de Q2',
       chainSystemPrompt: `Eres el Constructor de regex de este pipeline. Recibirás el análisis de casos del cuadrante anterior.
@@ -1891,7 +2029,7 @@ Tu estrategia será la guía del implementador.`,
     q3: {
       title: '💡 Implementador de Scraper',
       models: [
-        { id: 'qwen/qwen-2.5-coder-72b:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
       ],
       role: 'Implementa el scraper completo siguiendo la estrategia de Q2',
       chainSystemPrompt: `Eres el Implementador de este pipeline de scraping. Recibirás la estrategia de extracción del cuadrante anterior.
@@ -1932,7 +2070,7 @@ Produce: (1) servicios necesarios y sus responsabilidades, (2) networking: puert
     q3: {
       title: '💡 Builder de Configuraciones',
       models: [
-        { id: 'qwen/qwen-2.5-coder-72b:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
       ],
       role: 'Escribe todos los archivos de configuración basado en el blueprint de Q2',
       chainSystemPrompt: `Eres el Builder de configuraciones de este pipeline. Recibirás el blueprint de infraestructura del cuadrante anterior.
@@ -2023,7 +2161,7 @@ Tu modelo será la base para generar el DDL completo.`,
     q3: {
       title: '💡 DDL Builder',
       models: [
-        { id: 'qwen/qwen-2.5-coder-72b:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
       ],
       role: 'Genera el DDL SQL completo basado en el modelo de Q2',
       chainSystemPrompt: `Eres el DDL Builder de este pipeline. Recibirás el modelo de datos del cuadrante anterior.
@@ -2069,7 +2207,7 @@ Tu análisis guiará la construcción de la fórmula correcta.`,
     q3: {
       title: '💡 DAX Builder',
       models: [
-        { id: 'qwen/qwen-2.5-coder-72b:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
       ],
       role: 'Escribe la fórmula DAX completa basada en el análisis de Q2',
       chainSystemPrompt: `Eres el DAX Builder de este pipeline. Recibirás el análisis de contexto del cuadrante anterior.
@@ -2113,7 +2251,7 @@ Esta hoja de ruta guiará la implementación en M.`,
     q3: {
       title: '💡 M Builder',
       models: [
-        { id: 'qwen/qwen-2.5-coder-72b:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
       ],
       role: 'Escribe la query M completa siguiendo el diseño de Q2',
       chainSystemPrompt: `Eres el M Builder de este pipeline. Recibirás el diseño de transformación del cuadrante anterior.
@@ -2157,7 +2295,7 @@ Tu plan será la guía del implementador del pipeline Pandas.`,
     q3: {
       title: '💡 Pipeline Builder Pandas',
       models: [
-        { id: 'qwen/qwen-2.5-coder-72b:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
       ],
       role: 'Implementa el pipeline de limpieza basado en el plan de Q2',
       chainSystemPrompt: `Eres el Pipeline Builder de este pipeline. Recibirás el plan de limpieza de datos del cuadrante anterior.
@@ -2202,7 +2340,7 @@ Tu especificación matemática será implementada por un modelo especializado en
     q3: {
       title: '💡 Implementador Numérico',
       models: [
-        { id: 'qwen/qwen-2.5-coder-72b:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
       ],
       role: 'Implementa la simulación basado en el modelo matemático de Q2',
       chainSystemPrompt: `Eres el Implementador numérico de este pipeline. Recibirás la especificación matemática del cuadrante anterior.
@@ -2338,7 +2476,7 @@ Produce: (1) estimación de recursos: RAM necesaria, tiempo estimado con y sin o
     q3: {
       title: '💡 Implementador de Pipeline',
       models: [
-        { id: 'qwen/qwen-2.5-coder-72b:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
       ],
       role: 'Implementa el pipeline de procesamiento basado en la arquitectura de Q2',
       chainSystemPrompt: `Eres el Implementador de este pipeline de datos masivos. Recibirás la arquitectura de procesamiento del cuadrante anterior.
@@ -2385,7 +2523,7 @@ Tu estrategia guiará al implementador.`,
     q3: {
       title: '💡 Extractor PDF',
       models: [
-        { id: 'qwen/qwen-2.5-coder-72b:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
       ],
       role: 'Implementa el extractor basado en la estrategia de Q2',
       chainSystemPrompt: `Eres el Implementador de extracción PDF de este pipeline. Recibirás la estrategia de extracción del cuadrante anterior.
@@ -2431,7 +2569,7 @@ Produce: (1) distribuciones de entrada para cada variable con parámetros estima
     q3: {
       title: '💡 Simulador Monte Carlo',
       models: [
-        { id: 'qwen/qwen-2.5-coder-72b:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
       ],
       role: 'Implementa la simulación completa basada en el modelo de Q2',
       chainSystemPrompt: `Eres el Implementador de la simulación de este pipeline. Recibirás el modelo probabilístico del cuadrante anterior.
@@ -2481,7 +2619,7 @@ Produce: (1) triggers necesarios (onOpen, onEdit, onChange, time-based) y su con
     q3: {
       title: '💡 Desarrollador Apps Script',
       models: [
-        { id: 'qwen/qwen-2.5-coder-72b:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
       ],
       role: 'Implementa el script completo siguiendo el diseño de Q2',
       chainSystemPrompt: `Eres el Desarrollador Apps Script de este pipeline. Recibirás el diseño de automatización del cuadrante anterior.
@@ -2617,7 +2755,7 @@ Tu diseño será implementado en Python/Pandas.`,
     q3: {
       title: '💡 Implementador del Conciliador',
       models: [
-        { id: 'qwen/qwen-2.5-coder-72b:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
       ],
       role: 'Implementa el algoritmo de conciliación basado en el diseño de Q2',
       chainSystemPrompt: `Eres el Implementador de este pipeline de conciliación. Recibirás el diseño del algoritmo de matching del cuadrante anterior.
@@ -2710,7 +2848,7 @@ Tus cálculos serán la base de la cotización formal.`,
     q3: {
       title: '💡 Constructor de Cotización',
       models: [
-        { id: 'qwen/qwen-2.5-coder-72b:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
       ],
       role: 'Estructura la cotización completa basada en los cálculos de Q2',
       chainSystemPrompt: `Eres el Constructor de cotización de este pipeline. Recibirás los cálculos actuariales del cuadrante anterior.
@@ -3133,7 +3271,7 @@ Tu diseño guiará la implementación en Verse.`,
     q3: {
       title: '💡 Verse Developer',
       models: [
-        { id: 'qwen/qwen-2.5-coder-72b:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
       ],
       role: 'Implementa la lógica en Verse siguiendo el diseño de Q2',
       chainSystemPrompt: `Eres el Verse Developer de este pipeline. Recibirás el diseño de la mecánica del cuadrante anterior.
@@ -3826,7 +3964,7 @@ Tu auditoría arquitectural guiará la validación a nivel de código.`,
     q3: {
       title: '💡 Validador de Código Qwen',
       models: [
-        { id: 'qwen/qwen-2.5-coder-72b:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
       ],
       role: 'Valida sintaxis, edge cases y produce el código refactorizado',
       chainSystemPrompt: `Eres el Validador de código de este pipeline. Recibirás la auditoría arquitectural del cuadrante anterior.
@@ -4007,7 +4145,7 @@ Tu arquitectura guiará la implementación.`,
     q3: {
       title: '💡 Implementador de Flujo Qwen',
       models: [
-        { id: 'qwen/qwen-2.5-coder-72b:free', label: 'Qwen 2.5 Coder' },
+        { id: 'qwen/qwen-2.5-coder-32b-instruct:free', label: 'Qwen 2.5 Coder' },
       ],
       role: 'Implementa el flujo del agente en pseudocódigo o LangGraph',
       chainSystemPrompt: `Eres el Implementador de flujo de este pipeline. Recibirás la arquitectura del agente del cuadrante anterior.
@@ -4701,8 +4839,9 @@ function newConversation() {
   FileAttachments.clear();
   Q4Preview.reset();
 
-  // 6. Ocultar panel de síntesis
+  // 6. Ocultar panel de síntesis y limpiar bitácora técnica
   Synthesis.hide();
+  RunLog.clear();
 
   UI.toast('🔄 Nueva conversación iniciada. Historial limpiado.');
 }
@@ -4735,6 +4874,11 @@ document.addEventListener('DOMContentLoaded', () => {
       if (!Synthesis._report) return;
       navigator.clipboard.writeText(Synthesis._report).catch(() => {});
       UI.toast('📋 Reporte copiado al portapapeles');
+    });
+  document.getElementById('btn-generate-report')
+    ?.addEventListener('click', e => {
+      e.stopPropagation(); // evitar que el click cierre/abra el panel
+      downloadTechnicalReport();
     });
 
   // ── BLOQUE 2: Orquestador ─────────────────────────────────
