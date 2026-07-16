@@ -451,6 +451,8 @@ Lógica en DOMContentLoaded:
 | q4SystemPrompt por tarea | ✅ Completo | Override en run, restaura ANTI_FLUFF |
 | Launcher VBS silencioso | ✅ Completo | Sin ventana negra, `WshShell.Run(..., 0)` |
 | DevSim (entorno dev) | ✅ Dev only | `window.simulateNetworkError(qId, 429/402)` |
+| Auto-unlock por dispositivo | ✅ v1.4.5 | `navia_device_key` + `navia_auto_enc`; cero fricción al recargar |
+| Persistencia de historial entre recargas | ✅ v1.4.5 | `navia_session_history`; restaura últimos 6 msg/cuadrante |
 
 ### ⚠️ Conocido / Pendiente
 
@@ -474,6 +476,9 @@ Lógica en DOMContentLoaded:
 | `navia_theme` | `'light'` \| `'dark'` | Tema activo |
 | `navia_q1_color` … `navia_q4_color` | `#rrggbb` | Color personalizado de cuadrante |
 | `navia_session_summary` | JSON `{ q1, q2, q3, q4, lastRun }` | Resumen compactado por cuadrante (`Memory.compact()`), usado por `SessionBanner`. Solo texto semántico — nunca respuestas completas ni keys. |
+| `navia_device_key` | string base64 (44 chars) | Llave aleatoria del dispositivo (32 bytes). Generada una vez. Sin valor sensible por sí sola. |
+| `navia_auto_enc` | JSON `{salt,iv,data}` Base64 | Llaves de API cifradas con la device key. Permite auto-unlock sin contraseña maestra al arrancar. |
+| `navia_session_history` | JSON `{q1,q2,q3,q4,savedAt}` | Últimos `MAX_HIST_PERSIST` mensajes por cuadrante. Restaurados al recargar. Limpiado en `newConversation()`. |
 
 ### Variables globales volátiles (RAM)
 
@@ -547,6 +552,21 @@ Checklist:
 ---
 
 ## 14. Changelog
+
+### v1.4.5 — Julio 2026
+- **[NEW] Auto-unlock por dispositivo** — módulo `AutoUnlock`: genera `navia_device_key`
+  (32 bytes aleatorios, una vez por dispositivo), cifra una copia de las llaves de API con
+  esa llave vía AES-GCM (`Crypto.encrypt/decrypt` existente) y la guarda en `navia_auto_enc`.
+  Al arrancar, `AutoUnlock.tryUnlock()` en el inicio de `DOMContentLoaded` (ahora `async`)
+  descifra las llaves sin UI. `SettingsModal._save()`, `LockScreen._submit()` y
+  `_unlockFloor2()` mantienen el blob sincronizado. `LockScreen._reset()` lo limpia.
+  SettingsModal Piso 2 sigue requiriendo contraseña maestra para ver/modificar llaves.
+- **[NEW] Persistencia de historial de sesión** — módulo `SessionPersistence`: guarda los
+  últimos `MAX_HIST_PERSIST=6` mensajes (user+assistant) por cuadrante en `navia_session_history`
+  al terminar cada `Orchestrator.run()` y tras cada `Memory.compact()`. Al recargar sin llamar
+  `newConversation()`, el historial se restaura automáticamente (después de `Memory.init()` para
+  preservar los system prompts correctos). `newConversation()` limpia el snapshot. Toast
+  informativo al detectar restauración exitosa.
 
 ### v1.4.4 — Julio 2026 *(sesión actual)*
 - **[NEW] Blindaje anti-RateLimit (429/402)** — hasta 6 peticiones podían dispararse en

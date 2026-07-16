@@ -22,6 +22,12 @@ const TOTAL_KEY_SLOTS   = 5;
 // Clave para persistir el resumen compactado de sesión entre recargas
 const SESSION_SUMMARY_KEY = 'navia_session_summary';
 
+// ── Auto-unlock y Persistencia de Sesión ──────────────────────
+const AUTO_ENC_KEY        = 'navia_auto_enc';       // blob cifrado con device key
+const DEVICE_KEY_STOR     = 'navia_device_key';     // llave aleatoria del dispositivo
+const SESSION_HISTORY_KEY = 'navia_session_history'; // historial comprimido de sesión
+const MAX_HIST_PERSIST    = 6;                      // máx mensajes (user+assistant) por cuadrante
+
 // ── Entorno ────────────────────────────────────────────────────
 // Cambiar a `true` antes de cualquier despliegue a producción.
 // Efecto: deshabilita DevSim, no expone herramientas de test en `window`.
@@ -185,6 +191,7 @@ const LockScreen = {
       this._destroy();
       UI.updateSettingsBtn();
       if (cb) cb();
+      AutoUnlock.save(AppState.apiKeys); // fire-and-forget: mantener blob vigente
     } catch {
       errEl.classList.remove('hidden');
       input.value = '';
@@ -197,6 +204,7 @@ const LockScreen = {
   _reset() {
     if (!confirm('⚠ Esto eliminará TODAS las llaves guardadas de forma permanente. ¿Continuar?')) return;
     Storage.clear();
+    AutoUnlock.clear(); // eliminar blob de auto-unlock
     AppState.apiKeys    = [];
     AppState.isUnlocked = false;
     this._destroy();
@@ -495,6 +503,8 @@ const SettingsModal = {
       this._bindFloor2Save(isFirstTime);
       this._validate();
       UI.updateSettingsBtn();
+      // Crear blob auto-unlock si no existe (primer uso, migración o reset manual de localStorage)
+      if (!localStorage.getItem(AUTO_ENC_KEY)) AutoUnlock.save(AppState.apiKeys);
     } catch {
       if (unlockBtn) { unlockBtn.textContent = 'Desbloquear'; unlockBtn.disabled = false; }
       if (unlockErr) unlockErr.classList.remove('hidden');
@@ -605,6 +615,7 @@ const SettingsModal = {
     try {
       const encrypted = await Crypto.encrypt(JSON.stringify(keys), pwdToUse);
       Storage.save(encrypted);
+      AutoUnlock.save(keys); // fire-and-forget: actualizar blob de auto-unlock del dispositivo
       AppState.apiKeys    = keys;
       AppState.isUnlocked = true;
       KeyPool.reset(); // set de llaves nuevo → limpiar enfriamientos y muertas previas
@@ -1331,6 +1342,8 @@ const Memory = {
           });
           localStorage.setItem(SESSION_SUMMARY_KEY, JSON.stringify(existing));
         } catch { /* non-critical */ }
+
+        SessionPersistence.save(); // snapshot post-compactación para continuidad de sesión
       }
       // Si summary === null (fallo de red / API o sin llave viva), el historial queda como estaba
     } catch (err) {
@@ -1677,6 +1690,7 @@ const Orchestrator = {
 
     // Mostrar panel de síntesis con comparativa de cuadrantes activos
     Synthesis.render(downstream, finalPrompt);
+    SessionPersistence.save(); // snapshot post-ejecución para continuidad de sesión
   },
 
   // ── Modo paralelo — comportamiento original sin cambios funcionales ──
@@ -5200,10 +5214,11 @@ function newConversation() {
   FileAttachments.clear();
   Q4Preview.reset();
 
-  // 6. Ocultar panel de síntesis, limpiar bitácora técnica y resumen de sesión
+  // 6. Ocultar panel de síntesis, limpiar bitácora técnica, historial y resumen de sesión
   Synthesis.hide();
   RunLog.clear();
   SessionBanner.clear();
+  SessionPersistence.clear(); // borra snapshot de historial persistido
 
   UI.toast('🔄 Nueva conversación iniciada. Historial limpiado.');
 }
@@ -5276,9 +5291,145 @@ const SessionBanner = {
 };
 
 // ============================================================
+// MÓDULO AUTO-UNLOCK — Desbloqueo automático por dispositivo
+// ============================================================
+// Permite que las llaves de API se recuperen sin contraseña maestra
+// al recargar la app en el mismo dispositivo.
+//
+// Mecanismo: genera una "llave de dispositivo" (bytes aleatorios)
+// almacenada en localStorage. Con ella cifra una copia de las llaves
+// de API usando el mismo AES-GCM + PBKDF2 del sistema. Al arrancar,
+// si ambos artefactos existen, el descifrado es automático.
+//
+// Modelo de seguridad: quien acceda a localStorage con conocimiento
+// del formato puede descifrar este blob. Apropiado para herramienta
+// personal en localhost de un solo usuario.
+// La copia cifrada con contraseña maestra (nav_ia_keys_enc) permanece
+// intacta y sigue siendo la fuente de verdad para SettingsModal Piso 2.
+// ============================================================
+const AutoUnlock = {
+  // Retorna la llave de dispositivo existente; la genera si no existe.
+  _getOrCreateDeviceKey() {
+    let dk = localStorage.getItem(DEVICE_KEY_STOR);
+    if (!dk) {
+      dk = Crypto.toBase64(Crypto.randomBytes(32));
+      localStorage.setItem(DEVICE_KEY_STOR, dk);
+    }
+    return dk;
+  },
+
+  // Cifra las keys con la llave de dispositivo y guarda el blob.
+  // Fire-and-forget: los errores son silenciosos (no crítico para el flujo principal).
+  async save(plainKeys) {
+    if (!plainKeys?.length) return;
+    try {
+      const dk  = this._getOrCreateDeviceKey();
+      const enc = await Crypto.encrypt(JSON.stringify(plainKeys), dk);
+      localStorage.setItem(AUTO_ENC_KEY, JSON.stringify(enc));
+    } catch { /* non-critical */ }
+  },
+
+  // Intenta auto-desbloquear usando la llave de dispositivo.
+  // Retorna true si las keys se cargaron exitosamente en AppState.
+  async tryUnlock() {
+    const rawEnc = localStorage.getItem(AUTO_ENC_KEY);
+    const dk     = localStorage.getItem(DEVICE_KEY_STOR);
+    if (!rawEnc || !dk || !Storage.hasKeys()) return false;
+    try {
+      const enc   = JSON.parse(rawEnc);
+      const plain = await Crypto.decrypt(enc, dk);
+      const keys  = JSON.parse(plain);
+      if (!Array.isArray(keys) || keys.length < MIN_KEYS) return false;
+      AppState.apiKeys    = keys;
+      AppState.isUnlocked = true;
+      return true;
+    } catch {
+      return false; // blob corrupto o device key incorrecta → falla silenciosa
+    }
+  },
+
+  // Elimina el blob de auto-unlock.
+  // NO borra navia_device_key — se reutiliza si el usuario re-configura las llaves.
+  clear() {
+    localStorage.removeItem(AUTO_ENC_KEY);
+  },
+};
+
+// ============================================================
+// MÓDULO SESSION PERSISTENCE — Continuidad del historial entre recargas
+// ============================================================
+// Persiste los últimos MAX_HIST_PERSIST mensajes de cada cuadrante
+// en localStorage. Al recargar sin Nueva Conversación, el historial
+// se restaura sobre los system prompts inicializados por Memory.init().
+//
+// Invariantes:
+//   - Solo persiste mensajes user/assistant (NO history[0] = system prompt).
+//   - Memory.init() corre antes de restore() para establecer el system prompt correcto.
+//   - Se llama al terminar Orchestrator.run() y tras cada Memory.compact().
+//   - newConversation() limpia el snapshot.
+//   - Tamaño máximo estimado: 4Q × MAX_HIST_PERSIST × ~16KB ≈ 384KB.
+// ============================================================
+const SessionPersistence = {
+  // Guarda los mensajes recientes de cada cuadrante a localStorage.
+  save() {
+    try {
+      const snapshot = {};
+      [1, 2, 3, 4].forEach(qId => {
+        const hist = QuadrantState[qId].history;
+        if (hist.length <= 1) return; // solo system prompt → nada útil
+        // Guardar solo mensajes después del system prompt (history[0])
+        const messages = hist.slice(1);
+        const recent   = messages.slice(-MAX_HIST_PERSIST);
+        if (recent.length) snapshot[`q${qId}`] = recent;
+      });
+      if (!Object.keys(snapshot).length) return;
+      snapshot.savedAt = Date.now();
+      localStorage.setItem(SESSION_HISTORY_KEY, JSON.stringify(snapshot));
+    } catch { /* non-critical */ }
+  },
+
+  // Restaura los mensajes guardados en los historiales de cada cuadrante.
+  // DEBE llamarse DESPUÉS de Memory.init() — antepone el system prompt ya inicializado.
+  // Retorna true si se restauró al menos un cuadrante.
+  restore() {
+    try {
+      const raw = localStorage.getItem(SESSION_HISTORY_KEY);
+      if (!raw) return false;
+      const snapshot = JSON.parse(raw);
+      let restored = false;
+      [1, 2, 3, 4].forEach(qId => {
+        const msgs = snapshot[`q${qId}`];
+        if (Array.isArray(msgs) && msgs.length > 0) {
+          // Anteponer el system prompt establecido por Memory.init()
+          QuadrantState[qId].history = [QuadrantState[qId].history[0], ...msgs];
+          restored = true;
+        }
+      });
+      return restored;
+    } catch {
+      return false;
+    }
+  },
+
+  // Elimina el snapshot al iniciar una nueva conversación.
+  clear() {
+    localStorage.removeItem(SESSION_HISTORY_KEY);
+  },
+};
+
+// ============================================================
 // ARRANQUE
 // ============================================================
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
+  // ── BLOQUE 0: Auto-unlock silencioso al arrancar ──────────
+  // Si hay llaves guardadas y existe el blob de device key, se descifran
+  // sin pedir contraseña. El pipeline queda listo desde el primer render.
+  if (Storage.hasKeys()) {
+    const unlocked = await AutoUnlock.tryUnlock();
+    if (unlocked) UI.updateSettingsBtn();
+  }
+
+  // ── BLOQUE 1: Seguridad ────────────────────────────────────
   // ── BLOQUE 1: Seguridad ────────────────────────────────────
   document.getElementById('btn-settings')
     ?.addEventListener('click', () => SettingsModal.open());
@@ -5462,6 +5613,12 @@ document.addEventListener('DOMContentLoaded', () => {
   // Debe llamarse DESPUÉS de que QuadrantState ya esté definido y al
   // final del arranque para no ser sobreescrito por otros init.
   Memory.init();
+
+  // Restaurar historial de sesión anterior si newConversation() no fue llamado.
+  // DEBE ir después de Memory.init() para que history[0] (system prompt) ya exista.
+  if (SessionPersistence.restore()) {
+    UI.toast('🔄 Sesión anterior restaurada — puedes continuar donde lo dejaste.', 4000);
+  }
 
   // Mostrar resumen de sesión anterior si existe
   SessionBanner.show();
